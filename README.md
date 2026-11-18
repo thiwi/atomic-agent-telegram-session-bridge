@@ -185,6 +185,8 @@ and reloading the latest context between desktop and Telegram turns.
 
 `verify.mjs` runs the upstream production typecheck, import checks, documentation
 checks, Telegram tests, runtime turn ownership tests, and test-typecheck baseline.
+The full upstream test typecheck uses a 4 GiB Node heap by default; an explicit
+`NODE_OPTIONS` heap setting takes precedence.
 
 Edit the patch against the pinned source revision, rebuild and retest it, then
 commit the updated patch. Review `git diff` and run the privacy scanner before
