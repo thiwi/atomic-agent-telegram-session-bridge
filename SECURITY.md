@@ -15,6 +15,12 @@ The bridge allows desktop linking only in the paired owner's private chat.
 Groups and incognito sessions cannot link. It does not add an HTTP listener.
 Telegram receives status, project paths, answers and requested output.
 
+Review buttons use expiring, one-use tokens bound to the owner, chat, message
+and session. Approval checks the retained plan/session and Git state again at
+execution; it does not broaden tool permissions. Rejecting a plan does not undo
+existing edits. External programs do not share the runtime lock, and ignored
+untracked files are outside the Git review snapshot.
+
 ## Reporting vulnerabilities
 
 Use GitHub's private vulnerability reporting when it is available. Otherwise

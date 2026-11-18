@@ -1,8 +1,8 @@
 diff --git a/src/channels/docs/adapters.md b/src/channels/docs/adapters.md
-index 41f6665..e94284c 100644
+index 41f6665..5b598b5 100644
 --- a/src/channels/docs/adapters.md
 +++ b/src/channels/docs/adapters.md
-@@ -31,3 +31,38 @@ Microsoft Teams ([msteams-channel](../msteams/msteams-channel.ts), ATO-506) uses
+@@ -31,3 +31,72 @@ Microsoft Teams ([msteams-channel](../msteams/msteams-channel.ts), ATO-506) uses
  Shared model commands currently import provider persistence from TUI; stage 02 moves that responsibility. Do not describe this boundary as already repaired.
  
  Sources: [Telegram](../telegram/telegram-channel.ts), [Discord](../discord/discord-channel.ts), [Swarm](../swarm/swarm-registry.ts), [model commands](../model-command.ts), [backoff](../reconnect-backoff.ts). Tests: [Telegram](../telegram/telegram-channel.test.ts), [cron](../telegram/cron-command.test.ts), [Discord](../discord/discord-channel.test.ts), [model commands](../telegram/inbound-model-command.test.ts).
@@ -41,6 +41,40 @@ index 41f6665..e94284c 100644
 +settlement. The runtime combines its cancellation signal with the caller's
 +signal. Tool cancellation remains cooperative, preserving completed effects.
 +Channel shutdown cancels all remote queues before stopping its active turns.
++
++## Telegram desktop plan review
++
++The desktop bridge's `/review` command ([review](../telegram/desktop-review.ts),
++[Git snapshot](../telegram/desktop-review-git.ts)) shows the latest final answer
++as a proposed plan, a summary of all staged/unstaged/untracked changes in that
++repository, and retained shell verification evidence from the latest request.
++`/review diff` also includes the tracked-file patch. It performs no inference,
++executes no tests, and changes neither files nor the Git index. Tool status is
++not presented as proof that a test suite passed; missing/truncated evidence is
++explicit. The report masks recognized credentials and known environment secrets.
++
++Only an idle linked desktop session with no outstanding Telegram work can be
++reviewed. The whole report must be delivered before a separate message offers
++**Approve plan** / **Reject plan**. Reject only dismisses the review; it does not
++revert existing changes. Approval queues implementation of the exact answer
++that was shown, with ordinary tool permissions still enforced. This is a plan
++workflow, not a global requirement for every other chat command or local edit.
++
++Review buttons are random one-use tokens bound to the paired owner, private
++chat, keyboard message and selected session. They expire after 30 minutes;
++a new review, reconnect or shutdown invalidates old buttons. Session history
++and plan state plus Git HEAD, index diff and working-tree bytes are checked
++again on approval and under the runtime FIFO before inference. The runtime's
++local `beforeRun` precondition is not available in goal mode. Queued approvals
++cannot silently apply to changed sessions. External programs do not share this
++lock: a review is a freshness check, not a filesystem transaction or rollback.
++
++Snapshots are bounded to 10,000 tracked/untracked files, 64 MiB of file bytes,
++2 MiB per Git command and 10 seconds per Git command. Ignored untracked files
++are outside the snapshot. Symlinks/submodules and incomplete snapshots are
++refused; a report above 32,000 characters cannot produce an approval. Large
++projects must narrow their worktree or be reviewed locally. The snapshot hashes
++untracked content but does not display it in the patch.
 diff --git a/src/channels/telegram/desktop-request-queue.test.ts b/src/channels/telegram/desktop-request-queue.test.ts
 new file mode 100644
 index 0000000..900d463
@@ -160,6 +194,437 @@ index 0000000..a3c2ea0
 +  }
 +
 +  settled(): Promise<void> { return this.tail; }
++}
+diff --git a/src/channels/telegram/desktop-review-git.test.ts b/src/channels/telegram/desktop-review-git.test.ts
+new file mode 100644
+index 0000000..93007ac
+--- /dev/null
++++ b/src/channels/telegram/desktop-review-git.test.ts
+@@ -0,0 +1,59 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { execFileSync } from "node:child_process";
++import { mkdtempSync, rmSync, writeFileSync, symlinkSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { captureDesktopGitReview } from "./desktop-review-git.js";
++
++let dir: string;
++const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
++beforeEach(() => {
++  dir = mkdtempSync(join(tmpdir(), "atomic-review-"));
++  git("init", "-q");
++  git("config", "core.autocrlf", "false");
++  writeFileSync(join(dir, "tracked.txt"), "before\n");
++  git("add", "tracked.txt");
++  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "fixture");
++});
++afterEach(() => rmSync(dir, { recursive: true, force: true }));
++
++describe("Git review snapshot", () => {
++  it("reads staged, unstaged and untracked state without changing the index", async () => {
++    writeFileSync(join(dir, "tracked.txt"), "staged\n");
++    git("add", "tracked.txt");
++    writeFileSync(join(dir, "tracked.txt"), "working\n");
++    writeFileSync(join(dir, "new file.txt"), "new\n");
++    const before = git("status", "--porcelain=v1");
++    const snapshot = await captureDesktopGitReview(dir);
++    expect(snapshot.summary).toContain("Staged:");
++    expect(snapshot.summary).toContain("Unstaged:");
++    expect(snapshot.summary).toContain('"new file.txt"');
++    expect(snapshot.diff).toContain("+staged");
++    expect(snapshot.diff).toContain("+working");
++    expect(git("status", "--porcelain=v1")).toBe(before);
++    expect((await captureDesktopGitReview(dir)).fingerprint).toBe(snapshot.fingerprint);
++  });
++
++  it("detects same-size untracked and tracked edits even when status is unchanged", async () => {
++    writeFileSync(join(dir, "new.txt"), "one");
++    const first = await captureDesktopGitReview(dir);
++    writeFileSync(join(dir, "new.txt"), "two");
++    const second = await captureDesktopGitReview(dir);
++    expect(second.fingerprint).not.toBe(first.fingerprint);
++    writeFileSync(join(dir, "tracked.txt"), "AFTER!\n");
++    expect((await captureDesktopGitReview(dir)).fingerprint).not.toBe(second.fingerprint);
++  });
++
++  it("supports an unborn repository and refuses a directory without Git", async () => {
++    git("checkout", "--orphan", "unborn");
++    git("rm", "--cached", "tracked.txt");
++    expect((await captureDesktopGitReview(dir)).summary).toContain("Untracked");
++    rmSync(join(dir, ".git"), { recursive: true, force: true });
++    await expect(captureDesktopGitReview(dir)).rejects.toThrow();
++  });
++
++  it.skipIf(process.platform === "win32")("refuses symlinks rather than following them outside the project", async () => {
++    symlinkSync(join(dir, "tracked.txt"), join(dir, "link.txt"));
++    await expect(captureDesktopGitReview(dir)).rejects.toThrow("symlinks");
++  });
++});
+diff --git a/src/channels/telegram/desktop-review-git.ts b/src/channels/telegram/desktop-review-git.ts
+new file mode 100644
+index 0000000..d5a530a
+--- /dev/null
++++ b/src/channels/telegram/desktop-review-git.ts
+@@ -0,0 +1,75 @@
++import { execFile } from "node:child_process";
++import { createHash } from "node:crypto";
++import { createReadStream } from "node:fs";
++import { lstat, realpath } from "node:fs/promises";
++import { resolve, relative, isAbsolute, sep } from "node:path";
++import { promisify } from "node:util";
++
++const execute = promisify(execFile);
++const MAX_BYTES = 2 * 1024 * 1024;
++
++/** Read only: no shell, optional index writes, external diff drivers or fsmonitor. */
++async function git(cwd: string, args: string[]): Promise<string> {
++  const result = await execute("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", ...args], {
++    cwd, timeout: 10_000, maxBuffer: MAX_BYTES, windowsHide: true,
++    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_PAGER: "cat" },
++  });
++  return result.stdout;
++}
++
++export interface DesktopGitReview {
++  fingerprint: string;
++  summary: string;
++  diff: string;
++}
++
++/** Fail closed on oversized/unstable snapshots; never silently approve a partial tree. */
++export async function captureDesktopGitReview(workingDir: string): Promise<DesktopGitReview> {
++  const root = (await git(workingDir, ["rev-parse", "--show-toplevel"])).trim();
++  if (!root) throw new Error("No Git working tree.");
++  const status = await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
++  const tracked = await git(root, ["ls-files", "-z"]);
++  const untracked = await git(root, ["ls-files", "--others", "--exclude-standard", "-z"]);
++  const paths = [...new Set((tracked + untracked).split("\0").filter(Boolean))];
++  if (paths.length > 10_000) throw new Error("The repository is too large for a bounded review.");
++  const hash = createHash("sha256").update(status);
++  let total = 0;
++  // Hash actual worktree bytes, including untracked files. A second snapshot at
++  // execution catches edits after the button was shown, even same-size edits.
++  for (const file of paths.sort()) {
++    hash.update(JSON.stringify(file));
++    const path = resolve(root, file);
++    const rel = relative(root, path);
++    if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) throw new Error("Unsafe Git path.");
++    const stat = await lstat(path).catch(error => {
++      if (error.code === "ENOENT") return null;
++      throw error;
++    });
++    if (!stat) { hash.update("missing"); continue; }
++    // Symlinks and submodules may point outside the reviewed project. Keep the
++    // implementation conservative rather than reading or claiming coverage.
++    if (!stat.isFile() || (await realpath(path)) !== path) throw new Error("Review does not support symlinks or submodules.");
++    total += stat.size;
++    if (total > 32 * MAX_BYTES) throw new Error("The repository exceeds the review byte limit.");
++    let bytes = 0;
++    for await (const chunk of createReadStream(path)) {
++      bytes += chunk.length;
++      if (bytes > stat.size || bytes + total - stat.size > 32 * MAX_BYTES) throw new Error("The repository changed during review.");
++      hash.update(chunk);
++    }
++    if (bytes !== stat.size) throw new Error("The repository changed during review.");
++  }
++  const head = await git(root, ["rev-parse", "--verify", "HEAD"]).catch(() => "unborn");
++  const baseArgs = ["--no-ext-diff", "--no-textconv", "--binary"];
++  const staged = await git(root, ["diff", "--cached", ...baseArgs]);
++  const unstaged = await git(root, ["diff", ...baseArgs]);
++  const stats = await git(root, ["diff", "--stat", "--no-ext-diff", "--no-textconv"]);
++  const stagedStats = await git(root, ["diff", "--cached", "--stat", "--no-ext-diff", "--no-textconv"]);
++  if (status !== await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])) throw new Error("The repository changed during review.");
++  hash.update(root).update(head).update(staged).update(unstaged);
++  return {
++    fingerprint: hash.digest("hex"),
++    summary: [stagedStats.trim() ? `Staged:\n${stagedStats.trim()}` : "", stats.trim() ? `Unstaged:\n${stats.trim()}` : "", untracked ? `Untracked files (contents are not included in the diff):\n${untracked.split("\0").filter(Boolean).map(path => JSON.stringify(path)).join("\n")}` : ""].filter(Boolean).join("\n\n") || "No Git changes.",
++    diff: [staged ? `Staged diff:\n${staged}` : "", unstaged ? `Unstaged diff:\n${unstaged}` : ""].filter(Boolean).join("\n\n") || "No tracked-file diff.",
++  };
++}
+diff --git a/src/channels/telegram/desktop-review.test.ts b/src/channels/telegram/desktop-review.test.ts
+new file mode 100644
+index 0000000..a1784d7
+--- /dev/null
++++ b/src/channels/telegram/desktop-review.test.ts
+@@ -0,0 +1,126 @@
++import { describe, expect, it, vi } from "vitest";
++import { createEmptySessionState } from "../../session/index.js";
++import { DesktopReviewBridge, desktopReviewEvidence, type DesktopReviewDeps } from "./desktop-review.js";
++
++function fixture() {
++  const session = createEmptySessionState({ id: "desktop", workingDir: "/work/project", metadata: { desktopTelegramBridge: true } });
++  session.turns = [{ kind: "user", text: "Prepare a plan", at: 1 }, { kind: "assistant_reply", text: "Extract a helper and test it.", at: 2 }];
++  const sent: Array<{ text: string; opts?: Record<string, unknown> }> = [];
++  const api = {
++    sendMessage: vi.fn(async (_chat: number, text: string, opts?: Record<string, unknown>) => { sent.push({ text, opts }); return { message_id: sent.length }; }),
++    editMessageText: vi.fn(async () => {}), answerCallbackQuery: vi.fn(async () => {}),
++  };
++  const captureGit = vi.fn(async () => ({ fingerprint: "tree1", summary: "1 file changed", diff: "+helper()" }));
++  const enqueue = vi.fn<DesktopReviewDeps["enqueue"]>(async () => true);
++  const deps: DesktopReviewDeps = { api, ownerUserId: 42, loadSession: () => session, currentSession: () => session.id, isBusy: () => false, hasQueued: () => false, enqueue, captureGit, now: () => 100 };
++  const bridge = new DesktopReviewBridge(deps);
++  function click(action = "a") {
++    const message = [...sent.map((item, index) => ({ ...item, index }))].reverse().find(item => item.opts?.reply_markup !== undefined)!;
++    const keyboard = message.opts!.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
++    const data = keyboard.inline_keyboard[0]![action === "a" ? 0 : 1]!.callback_data;
++    return { id: "callback", from: { id: 42 }, message: { chat: { id: 42 }, message_id: message.index + 1 }, data };
++  }
++  return { session, sent, api, captureGit, enqueue, deps, bridge, click };
++}
++
++describe("desktop review", () => {
++  it("shows a read-only report and only enqueues the exact plan after approval", async () => {
++    const f = fixture();
++    await f.bridge.show(f.session, 42);
++    expect(f.enqueue).not.toHaveBeenCalled();
++    expect(f.sent[0]?.text).toContain("Extract a helper and test it.");
++    expect(f.sent[0]?.text).toContain("1 file changed");
++    expect(f.sent[0]?.text).toContain("No retained test/build/lint evidence");
++    const update = f.click();
++    expect(Buffer.byteLength(update.data)).toBeLessThanOrEqual(64);
++    await Promise.all([f.bridge.handleCallback(update), f.bridge.handleCallback(update)]);
++    expect(f.enqueue).toHaveBeenCalledOnce();
++    expect(f.enqueue.mock.calls[0]?.[2]).toContain("<approved-plan>\nExtract a helper and test it.");
++    const guard = f.enqueue.mock.calls[0]![3];
++    await expect(guard(f.session)).resolves.toBeUndefined();
++    f.captureGit.mockResolvedValue({ fingerprint: "tree2", summary: "changed", diff: "" });
++    await expect(guard(f.session)).rejects.toThrow("stale");
++  });
++
++  it("rejects a plan without running or reverting anything", async () => {
++    const f = fixture();
++    await f.bridge.show(f.session, 42);
++    await f.bridge.handleCallback(f.click("r"));
++    expect(f.enqueue).not.toHaveBeenCalled();
++    expect(f.sent.at(-1)?.text).toContain("Existing edits are kept");
++  });
++
++  it.each(["owner", "chat", "message", "data"])("ignores forged %s callbacks without consuming the valid review", async kind => {
++    const f = fixture();
++    await f.bridge.show(f.session, 42);
++    const update = f.click();
++    const forged = structuredClone(update);
++    if (kind === "owner") forged.from.id = 99;
++    if (kind === "chat") forged.message.chat.id = 99;
++    if (kind === "message") forged.message.message_id += 1;
++    if (kind === "data") forged.data = forged.data.replace(/:a$/, ":invalid");
++    await f.bridge.handleCallback(forged);
++    expect(f.enqueue).not.toHaveBeenCalled();
++    await f.bridge.handleCallback(update);
++    expect(f.enqueue).toHaveBeenCalledOnce();
++  });
++
++  it.each(["session", "tree", "expiry", "busy", "queued", "disconnect", "closed"])("refuses approval after %s changes", async kind => {
++    const f = fixture();
++    await f.bridge.show(f.session, 42);
++    const update = f.click();
++    if (kind === "session") f.session.turns.push({ kind: "user", text: "New task", at: 3 });
++    if (kind === "tree") f.captureGit.mockResolvedValue({ fingerprint: "tree2", summary: "changed", diff: "" });
++    if (kind === "expiry") f.deps.now = () => 2_000_000;
++    if (kind === "busy") f.deps.isBusy = () => true;
++    if (kind === "queued") f.deps.hasQueued = () => true;
++    if (kind === "disconnect") f.deps.currentSession = () => null;
++    if (kind === "closed") f.bridge.close();
++    await f.bridge.handleCallback(update);
++    expect(f.enqueue).not.toHaveBeenCalled();
++  });
++
++  it("expires older buttons when a new review is created", async () => {
++    const f = fixture();
++    await f.bridge.show(f.session, 42);
++    const old = f.click();
++    await f.bridge.show(f.session, 42, true);
++    expect(f.sent.some(item => item.text.includes("+helper()"))).toBe(true);
++    await f.bridge.handleCallback(old);
++    expect(f.enqueue).not.toHaveBeenCalled();
++    await f.bridge.handleCallback(f.click());
++    expect(f.enqueue).toHaveBeenCalledOnce();
++  });
++
++  it("fails closed when the report cannot be delivered or captured", async () => {
++    const f = fixture();
++    f.captureGit.mockRejectedValueOnce(new Error("git failed"));
++    await f.bridge.show(f.session, 42);
++    expect(f.sent.some(item => item.opts?.reply_markup)).toBe(false);
++    f.api.sendMessage.mockRejectedValue(new Error("offline"));
++    await f.bridge.show(f.session, 42);
++    expect(f.enqueue).not.toHaveBeenCalled();
++  });
++
++  it("does not approve a truncated plan or an answer from a previous request", async () => {
++    const f = fixture();
++    f.session.turns.push({ kind: "user", text: "new request", at: 3 });
++    await f.bridge.show(f.session, 42);
++    expect(f.sent.some(item => item.opts?.reply_markup)).toBe(false);
++    f.session.turns.push({ kind: "assistant_reply", text: "a".repeat(33_000), at: 4 });
++    await f.bridge.show(f.session, 42);
++    expect(f.sent.some(item => item.opts?.reply_markup)).toBe(false);
++  });
++
++  it("reports actual retained checks without labelling tool success as passing tests", () => {
++    const f = fixture();
++    f.session.turns.splice(1, 0,
++      { kind: "assistant_tool_call", tool: "os.shell.run", args: { command: "npm test" }, at: 2 },
++      { kind: "tool_result", tool: "os.shell.run", status: "ok", summary: "Tests 2 passed", truncated: true, at: 3 },
++    );
++    const evidence = desktopReviewEvidence(f.session);
++    expect(evidence).toContain("Tests 2 passed");
++    expect(evidence).toContain("does not prove tests passed");
++    expect(evidence).toContain("Stored output was truncated");
++  });
++});
+diff --git a/src/channels/telegram/desktop-review.ts b/src/channels/telegram/desktop-review.ts
+new file mode 100644
+index 0000000..3e054ac
+--- /dev/null
++++ b/src/channels/telegram/desktop-review.ts
+@@ -0,0 +1,147 @@
++import { createHash, randomBytes } from "node:crypto";
++import type { SessionState } from "../../session/index.js";
++import { knownSecretsFromEnv, maskSecrets } from "../../error-reporting/secret-detector.js";
++import type { InboundCallbackUpdate } from "./approval-bridge.js";
++import { isDesktopSession } from "./desktop-session-bridge.js";
++import { captureDesktopGitReview, type DesktopGitReview } from "./desktop-review-git.js";
++import { sendOutbound, type TelegramApi } from "./outbound-sender.js";
++
++const TTL_MS = 30 * 60 * 1000;
++const MAX_REPORT = 32_000;
++const safe = (text: string): string => maskSecrets(text, knownSecretsFromEnv(process.env));
++
++export function desktopReviewRevision(session: SessionState): string {
++  return createHash("sha256").update(JSON.stringify({ id: session.id, cwd: session.workingDir, turns: session.turns, plan: session.plan, status: session.status, stepCount: session.stepCount })).digest("hex");
++}
++
++export function desktopReviewPlan(session: SessionState): string | null {
++  const recent = [...session.turns].reverse();
++  const request = recent.findIndex(turn => turn.kind === "user" && !turn.steered);
++  const reply = recent.slice(0, request < 0 ? recent.length : request).find(turn => turn.kind === "assistant_reply" && !turn.progressNote && !turn.stopped && !turn.toolsRan);
++  return reply?.kind === "assistant_reply" && reply.text.trim() ? reply.text : null;
++}
++
++/** Evidence from retained tool results, never an inferred claim that tests passed. */
++export function desktopReviewEvidence(session: SessionState): string {
++  let request = -1;
++  session.turns.forEach((turn, index) => { if (turn.kind === "user" && !turn.steered) request = index; });
++  const pending = new Map<string, string[]>();
++  const evidence: string[] = [];
++  for (const turn of session.turns.slice(request < 0 ? 0 : request + 1)) {
++    if (turn.kind === "assistant_tool_call") {
++      const command = typeof turn.args.command === "string" ? turn.args.command : typeof turn.args.cmd === "string" ? turn.args.cmd : "";
++      const verification = /\b(?:(?:npm|pnpm|yarn)\s+(?:test|run\s+(?:test[^\s]*|lint|typecheck[^\s]*|build))|(?:npx\s+)?vitest|node\s+--test|pytest|cargo\s+test|go\s+test|swift\s+test|xcodebuild\b[^\n]*\btest\b)/u.test(command);
++      const list = pending.get(turn.tool) ?? [];
++      list.push(turn.tool.startsWith("os.shell.") && verification ? command : "");
++      pending.set(turn.tool, list);
++    } else if (turn.kind === "tool_result") {
++      const command = pending.get(turn.tool)?.shift();
++      if (command) evidence.push(`Command: ${command}\nTool status: ${turn.status}\n${turn.summary}${turn.truncated ? "\n[Stored output was truncated.]" : ""}`);
++    }
++  }
++  if (!evidence.length) return "No retained test/build/lint evidence for the latest request. Tests have not been verified by this review.";
++  return `Recorded verification evidence (not rerun; tool status alone does not prove tests passed):\n\n${evidence.join("\n\n")}`;
++}
++
++interface ReviewDraft {
++  id: string;
++  sessionId: string;
++  revision: string;
++  fingerprint: string;
++  plan: string;
++  createdAt: number;
++  messageId: number | null;
++}
++
++export interface DesktopReviewDeps {
++  api: TelegramApi;
++  ownerUserId: number | null;
++  loadSession(id: string): SessionState | null;
++  currentSession(chatId: number): string | null;
++  isBusy(id: string): boolean;
++  hasQueued(chatId: number): boolean;
++  enqueue(session: SessionState, chatId: number, prompt: string, beforeRun: (fresh: SessionState) => Promise<void>): Promise<boolean>;
++  captureGit?: typeof captureDesktopGitReview;
++  now?: () => number;
++}
++
++/** One-use, owner/chat/message/session-bound review buttons. No file mutations. */
++export class DesktopReviewBridge {
++  private readonly drafts = new Map<number, ReviewDraft>();
++  private readonly requests = new Map<number, object>();
++  private closed = false;
++  constructor(private readonly deps: DesktopReviewDeps) {}
++  close(): void { this.closed = true; this.drafts.clear(); this.requests.clear(); }
++  private now(): number { return this.deps.now?.() ?? Date.now(); }
++  private capture(session: SessionState): Promise<DesktopGitReview> { return (this.deps.captureGit ?? captureDesktopGitReview)(session.workingDir); }
++  private idle(session: SessionState, chatId: number): boolean {
++    return isDesktopSession(session) && this.deps.currentSession(chatId) === session.id && !this.deps.isBusy(session.id) && !this.deps.hasQueued(chatId) && !["running", "awaiting_approval", "awaiting_llm"].includes(session.status);
++  }
++  private async text(chatId: number, text: string): Promise<boolean> {
++    const result = await sendOutbound({ api: this.deps.api, chatId, text: safe(text), parseMode: "plain" });
++    return result.dropped === 0;
++  }
++  async show(session: SessionState, chatId: number, includeDiff = false): Promise<void> {
++    if (this.closed) return;
++    this.drafts.delete(chatId);
++    const request = {};
++    this.requests.set(chatId, request);
++    if (!this.idle(session, chatId)) { await this.text(chatId, "Wait for the linked desktop task and its queue to finish, then use /review."); return; }
++    const plan = desktopReviewPlan(session);
++    if (!plan) { await this.text(chatId, "No completed answer to review. Ask the desktop agent to prepare a plan first."); return; }
++    const revision = desktopReviewRevision(session);
++    let git: DesktopGitReview;
++    try { git = await this.capture(session); }
++    catch { await this.text(chatId, "Could not capture a complete Git review. No approval is available. Check that this is a Git worktree without symlinks/submodules and within the review limits."); return; }
++    const fresh = this.deps.loadSession(session.id);
++    if (this.closed || this.requests.get(chatId) !== request) return;
++    if (!fresh || !this.idle(fresh, chatId) || desktopReviewRevision(fresh) !== revision) { await this.text(chatId, "The session changed during review. Use /review again."); return; }
++    const report = `Desktop review — session ${session.id}\n\nProposed plan (latest final answer):\n${plan}\n\nCurrent Git changes (all changes in this repository; not attributed only to this agent):\n${git.summary}\n\n${desktopReviewEvidence(fresh)}${includeDiff ? `\n\n${git.diff}` : "\n\nUse /review diff to include the tracked-file patch."}`;
++    if (report.length > MAX_REPORT) { await this.text(chatId, "The review exceeds 32,000 characters. No approval was created. Narrow the plan or inspect the changes locally."); return; }
++    if (!await this.text(chatId, report) || this.closed || this.requests.get(chatId) !== request) return;
++    const draft: ReviewDraft = { id: randomBytes(12).toString("hex"), sessionId: session.id, revision, fingerprint: git.fingerprint, plan, createdAt: this.now(), messageId: null };
++    // A failed keyboard delivery must leave no usable approval behind.
++    try {
++      const message = await this.deps.api.sendMessage(chatId,
++        "Approve queues implementation of this exact plan. Reject dismisses this review. Existing edits are kept. Expires in 30 minutes. Normal tool permissions still apply.",
++        { reply_markup: { inline_keyboard: [[{ text: "Approve plan", callback_data: `review:${draft.id}:a` }, { text: "Reject plan", callback_data: `review:${draft.id}:r` }]] } });
++      if (typeof message === "object" && message !== null && "message_id" in message && typeof message.message_id === "number" && !this.closed && this.requests.get(chatId) === request) {
++        draft.messageId = message.message_id;
++        this.drafts.set(chatId, draft);
++      }
++    } catch { await this.text(chatId, "Could not send review buttons. No approval was created; use /review to retry."); }
++  }
++  async handleCallback(update: InboundCallbackUpdate): Promise<boolean> {
++    if (!update.data?.startsWith("review:")) return false;
++    const ack = async (text: string): Promise<void> => { try { await this.deps.api.answerCallbackQuery?.(update.id, { text }); } catch { /* No execution depends on the acknowledgement. */ } };
++    if (this.closed || this.deps.ownerUserId === null || update.from?.id !== this.deps.ownerUserId || !update.message) { await ack("Not available"); return true; }
++    const chatId = update.message.chat.id;
++    const draft = this.drafts.get(chatId);
++    const match = /^review:([a-f0-9]{24}):([ar])$/u.exec(update.data);
++    if (!match || !draft || match[1] !== draft.id || update.message.message_id !== draft.messageId) { await ack("Review expired or already resolved"); return true; }
++    // Consume before any await: replayed or simultaneous clicks execute once.
++    this.drafts.delete(chatId);
++    const finish = async (text: string): Promise<void> => {
++      await ack(text);
++      try { await this.deps.api.editMessageText?.(chatId, draft.messageId!, text, { reply_markup: { inline_keyboard: [] } }); } catch { /* Token is consumed even when the old keyboard cannot be edited. */ }
++      await this.text(chatId, text);
++    };
++    if (this.now() - draft.createdAt >= TTL_MS) { await finish("Review expired. Use /review again."); return true; }
++    if (match[2] === "r") { await finish("Plan rejected. No implementation was queued. Existing edits are kept."); return true; }
++    await ack("Checking review freshness…");
++    const session = this.deps.loadSession(draft.sessionId);
++    if (!session || !this.idle(session, chatId) || desktopReviewRevision(session) !== draft.revision) { await finish("The session changed. Use /review again before approving."); return true; }
++    const validate = async (fresh: SessionState): Promise<void> => {
++      if (this.closed || this.deps.currentSession(chatId) !== draft.sessionId || !isDesktopSession(fresh) || desktopReviewRevision(fresh) !== draft.revision || this.now() - draft.createdAt >= TTL_MS || (await this.capture(fresh)).fingerprint !== draft.fingerprint) {
++        throw new Error("The approved review is stale. Nothing was implemented; use /review again.");
++      }
++    };
++    try {
++      await validate(session);
++      const accepted = await this.deps.enqueue(session, chatId,
++        `The owner approved the following reviewed plan. Implement only this plan, run the relevant checks, and report changes and actual test results in English. Ask before making material changes to the approved scope. Normal tool permissions still apply.\n\n<approved-plan>\n${draft.plan}\n</approved-plan>`, validate);
++      await finish(accepted ? "Plan approved and queued for implementation. Use /status to follow progress or /stop to cancel." : "The request could not be queued. Use /review again.");
++    } catch { await finish("The review changed or could not be verified. Nothing was queued; use /review again."); }
++    return true;
++  }
 +}
 diff --git a/src/channels/telegram/desktop-session-bridge.test.ts b/src/channels/telegram/desktop-session-bridge.test.ts
 new file mode 100644
@@ -291,10 +756,18 @@ index 0000000..ecb36f1
 +  ].filter(Boolean).join("\n\n");
 +}
 diff --git a/src/channels/telegram/inbound-handler.test.ts b/src/channels/telegram/inbound-handler.test.ts
-index f76e2a2..1bc05df 100644
+index f76e2a2..a7aafff 100644
 --- a/src/channels/telegram/inbound-handler.test.ts
 +++ b/src/channels/telegram/inbound-handler.test.ts
-@@ -67,6 +67,7 @@ function makeFakeRuntime(opts: FakeRuntimeOpts = {}): {
+@@ -14,6 +14,7 @@ import { attachFailedAttempts } from "../../llm/fallback/failed-attempts.js";
+ 
+ import { createAttachmentInbox } from "../attachments/inbox.js";
+ import {
++  createDesktopReviewBridge,
+   handleInboundFile,
+   handleInboundText,
+   TELEGRAM_BOT_DOWNLOAD_LIMIT_BYTES,
+@@ -67,6 +68,7 @@ function makeFakeRuntime(opts: FakeRuntimeOpts = {}): {
      },
      sessionStore: {
        load: (id: string) => sessions.find((s) => s.id === id) ?? null,
@@ -302,7 +775,7 @@ index f76e2a2..1bc05df 100644
      },
      turnController: {
        isBusy: (id: string) => busy.has(id),
-@@ -218,6 +219,198 @@ describe("handleInboundText", () => {
+@@ -218,6 +220,216 @@ describe("handleInboundText", () => {
      rmSync(dir, { recursive: true, force: true });
    });
  
@@ -420,6 +893,24 @@ index f76e2a2..1bc05df 100644
 +    expect(ctx.releaseApprovalSession).not.toHaveBeenCalled();
 +  });
 +
++  it("routes /review only for a linked owner's private desktop session", async () => {
++    const desktop = createEmptySessionState({ id: "desktop-1", workingDir: "/work", metadata: { desktopTelegramBridge: true } });
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [desktop] });
++    const api = makeFakeApi();
++    const ctx: InboundContext = { ...makeContext(runtime, api, pointer, OWNER, join(dir, "inbox")), botIdentity: BOT };
++    ctx.desktopReviews = createDesktopReviewBridge(ctx);
++    const show = vi.spyOn(ctx.desktopReviews, "show").mockResolvedValue();
++    await handleInboundText(makeUpdate("/review"), ctx);
++    expect(show).not.toHaveBeenCalled();
++    await handleInboundText(makeUpdate("/desktop desktop-1"), ctx);
++    await handleInboundText(makeUpdate("/review diff", NON_OWNER), ctx);
++    await handleInboundText(makeUpdate("/review@atomic_bot", OWNER, "group"), ctx);
++    expect(show).not.toHaveBeenCalled();
++    await handleInboundText(makeUpdate("/review diff"), ctx);
++    expect(show).toHaveBeenCalledWith(desktop, CHAT, true);
++    expect(calls).toHaveLength(0);
++  });
++
 +  it("/queue accepts multiple desktop requests while /status remains available", async () => {
 +    const desktop = createEmptySessionState({ id: "desktop-1", workingDir: "/work", metadata: { desktopTelegramBridge: true } });
 +    const { runtime } = makeFakeRuntime({ initialSessions: [desktop] });
@@ -501,7 +992,7 @@ index f76e2a2..1bc05df 100644
    it("drops group-chat messages when the bot identity is unknown", async () => {
      // Without `getMe` there is no way to tell whether a group message
      // was addressed to us, so the safe answer is to stay quiet.
-@@ -1336,6 +1529,29 @@ describe("handleInboundFile", () => {
+@@ -1336,6 +1548,29 @@ describe("handleInboundFile", () => {
      expect(api.sent.some((m) => m.text === "got it")).toBe(true);
    });
  
@@ -532,35 +1023,38 @@ index f76e2a2..1bc05df 100644
      const { runtime, calls } = makeFakeRuntime(replyScript);
      const api = withDownload(makeFakeApi(), async () => new Uint8Array([1, 2]));
 diff --git a/src/channels/telegram/inbound-handler.ts b/src/channels/telegram/inbound-handler.ts
-index a2e67e8..5600c87 100644
+index a2e67e8..ba83925 100644
 --- a/src/channels/telegram/inbound-handler.ts
 +++ b/src/channels/telegram/inbound-handler.ts
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,6 @@
++import { DesktopReviewBridge } from "./desktop-review.js";
 +import { DesktopRequestQueue } from "./desktop-request-queue.js";
 +import { isDesktopSession, desktopReadCommand, desktopResult, desktopSessionStatus } from "./desktop-session-bridge.js";
  import type { AgentLoopEvent } from "../../agent/agent-contract.js";
  import {
    buildStatusSnapshot,
-@@ -123,6 +125,7 @@ export interface TelegramBotIdentity {
+@@ -123,6 +126,8 @@ export interface TelegramBotIdentity {
   * across messages and only the `inflight` map mutates.
   */
  export interface InboundContext {
 +  desktopQueues?: Map<string, DesktopRequestQueue>;
++  desktopReviews?: DesktopReviewBridge;
    runtime: AgentRuntime;
    api: TelegramApi;
    sessionPointer: TelegramSessionPointer;
-@@ -295,6 +298,10 @@ function helpText(ctx: InboundContext): string {
+@@ -295,6 +300,11 @@ function helpText(ctx: InboundContext): string {
      "Commands:\n" +
      "  /start, /help — this message\n" +
      "  /status — what this chat's turn is doing now (plan, last result, blocked, time), its session, and running background tasks\n" +
 +    "  /desktop [session-id] — connect this private chat to a desktop session; /desktop off disconnects\n" +
++    "  /review [diff] — review the latest plan, Git changes and recorded checks; approve or reject with buttons\n" +
 +    "  /queue <request> — queue a follow-up for the linked desktop session\n" +
 +    "  /stop — cancel the linked desktop task and its queued Telegram requests\n" +
 +    "  /result — show the desktop session's latest answer or analysis progress\n" +
      "  /sessions — every chat this bot has a session for\n" +
      "  /switch <session-id> — point this chat at an existing session\n" +
      "  /new — rotate this chat to a fresh session (current one is archived)\n" +
-@@ -375,6 +382,33 @@ export async function handleInboundText(
+@@ -375,6 +385,33 @@ export async function handleInboundText(
      await handleSlashCommand(text, ref, ctx, fromId);
      return;
    }
@@ -594,7 +1088,7 @@ index a2e67e8..5600c87 100644
    // Who is speaking, and in which group/topic. Skipped in a DM: a
    // private chat only ever reaches this line for the single configured
    // `ownerUserId`, so the block would restate a constant on every turn
-@@ -650,7 +684,10 @@ async function dispatchAttachments(
+@@ -650,7 +687,10 @@ async function dispatchAttachments(
    // group support, pass a `senderOf(...)` result as the 4th argument —
    // `withSenderIdentity` already composes correctly around an
    // attachments block.
@@ -606,10 +1100,18 @@ index a2e67e8..5600c87 100644
  }
  
  function enqueueMediaGroup(
-@@ -726,6 +763,46 @@ async function handleSlashCommand(
+@@ -726,6 +766,54 @@ async function handleSlashCommand(
      case "/help":
        await sendText(ctx, ref.target, helpText(ctx));
        return;
++    case "/review": {
++      const session = linkedDesktop(ref, ctx);
++      if (!session) { await sendText(ctx, ref.target, "Connect a desktop session first with /desktop."); return; }
++      if (rest.length > 1 || (rest[0] && rest[0] !== "diff")) { await sendText(ctx, ref.target, "Usage: /review [diff]"); return; }
++      ctx.desktopReviews ??= createDesktopReviewBridge(ctx);
++      await ctx.desktopReviews.show(session, ref.target.chatId, rest[0] === "diff");
++      return;
++    }
 +    case "/queue": {
 +      const session = linkedDesktop(ref, ctx);
 +      if (!session) {
@@ -653,7 +1155,7 @@ index a2e67e8..5600c87 100644
      case "/status":
        await sendText(ctx, ref.target, formatStatus(ref, ctx));
        return;
-@@ -786,6 +863,12 @@ async function handleSlashCommand(
+@@ -786,6 +874,12 @@ async function handleSlashCommand(
        return;
      }
      case "/cancel": {
@@ -666,7 +1168,7 @@ index a2e67e8..5600c87 100644
        const controller = ctx.inflight.get(ref.key);
        if (!controller) {
          await sendText(ctx, ref.target, "No turn in progress in this chat.");
-@@ -800,6 +883,94 @@ async function handleSlashCommand(
+@@ -800,6 +894,107 @@ async function handleSlashCommand(
    }
  }
  
@@ -681,18 +1183,30 @@ index a2e67e8..5600c87 100644
 +  return ref.isPrivate && session && isDesktopSession(session) ? session : null;
 +}
 +
-+async function queueDesktopRequest(text: string, ref: ChatRef, ctx: InboundContext, session: SessionState): Promise<void> {
++export function createDesktopReviewBridge(ctx: InboundContext): DesktopReviewBridge {
++  return new DesktopReviewBridge({
++    api: ctx.api,
++    ownerUserId: ctx.ownerUserId,
++    loadSession: id => ctx.runtime.sessionStore.load(id),
++    currentSession: chatId => ctx.sessionPointer.get(telegramChatKey(chatId)).current,
++    isBusy: id => ctx.runtime.turnController.isBusy(id),
++    hasQueued: chatId => ctx.inflight.has(telegramChatKey(chatId)) || (ctx.desktopQueues?.get(telegramChatKey(chatId))?.size ?? 0) > 0,
++    enqueue: (session, chatId, prompt, beforeRun) => queueDesktopRequest(prompt, { key: telegramChatKey(chatId), target: { chatId }, isPrivate: true, chatType: "private", label: "Desktop" }, ctx, session, beforeRun),
++  });
++}
++
++async function queueDesktopRequest(text: string, ref: ChatRef, ctx: InboundContext, session: SessionState, beforeRun?: (fresh: SessionState) => Promise<void>): Promise<boolean> {
 +  if (!ctx.runtime.turnController.isBusy(session.id) &&
 +      ["running", "awaiting_approval", "awaiting_llm"].includes(session.status)) {
 +    await sendText(ctx, ref.target, "Continue this active or interrupted session in this terminal process before queuing a follow-up.");
-+    return;
++    return false;
 +  }
 +  const queues = ctx.desktopQueues ??= new Map<string, DesktopRequestQueue>();
 +  let queue = queues.get(ref.key);
 +  if (!queue || queue.sessionId !== session.id) {
 +    if (queue?.size) {
 +      await sendText(ctx, ref.target, "The previous session still has queued requests. Use /cancel first.");
-+      return;
++      return false;
 +    }
 +    queue = new DesktopRequestQueue(session.id);
 +    queues.set(ref.key, queue);
@@ -705,7 +1219,7 @@ index a2e67e8..5600c87 100644
 +    if (!current || !isDesktopSession(current)) {
 +      throw new Error("The linked desktop session is no longer available.");
 +    }
-+    await dispatchToRuntime(text, ref, ctx, null, current, signal);
++    await dispatchToRuntime(text, ref, ctx, null, current, signal, beforeRun);
 +  }, error => {
 +    ctx.logger.warn("desktop Telegram follow-up failed", { error: scrubErrorMessage(error instanceof Error ? error.message : String(error)) });
 +    void sendText(ctx, ref.target, "The queued desktop request failed. Check /status before retrying.")
@@ -713,10 +1227,11 @@ index a2e67e8..5600c87 100644
 +  });
 +  if (!accepted) {
 +    await sendText(ctx, ref.target, "The desktop queue is full (20 outstanding requests). Wait for work to finish or use /cancel.");
-+    return;
++    return false;
 +  }
 +  await sendText(ctx, ref.target,
 +    `Request queued for desktop session ${session.id}. Outstanding Telegram requests: ${selectedQueue.size}. It will run after earlier work. Use /status to check progress.`);
++  return true;
 +}
 +
 +async function connectDesktopSession(id: string | undefined, ref: ChatRef, ctx: InboundContext): Promise<void> {
@@ -761,12 +1276,13 @@ index a2e67e8..5600c87 100644
  async function switchSession(
    sessionId: string | undefined,
    ref: ChatRef,
-@@ -878,9 +1049,14 @@ async function dispatchToRuntime(
+@@ -878,9 +1073,15 @@ async function dispatchToRuntime(
    ref: ChatRef,
    ctx: InboundContext,
    sender: SenderIdentity | null = null,
 +  desktopSession?: SessionState,
 +  queuedSignal?: AbortSignal,
++  beforeRun?: (fresh: SessionState) => Promise<void>,
  ): Promise<void> {
 -  const prompt = withSenderIdentity(text, sender);
 -  const session = acquireOrCreateSession(ref, ctx);
@@ -778,7 +1294,7 @@ index a2e67e8..5600c87 100644
    // Count agent-visible inbound messages (post owner-check, post
    // slash-command-shortcut). Slash commands and dropped non-owner
    // DMs are intentionally excluded — they never reach `runTurn`.
-@@ -891,8 +1067,12 @@ async function dispatchToRuntime(
+@@ -891,8 +1092,12 @@ async function dispatchToRuntime(
    // turn step can request approval — `ApprovalRouter.setForSession`
    // is the only path that turns a generic `ApprovalRequest` into a
    // 2-button keyboard in this chat. Idempotent on the channel side.
@@ -792,7 +1308,7 @@ index a2e67e8..5600c87 100644
    ctx.inflight.set(ref.key, controller);
  
    let reply: string | null = null;
-@@ -967,6 +1147,16 @@ async function dispatchToRuntime(
+@@ -967,6 +1172,16 @@ async function dispatchToRuntime(
            cadence.pollMs,
          );
    const eventHook = (event: AgentLoopEvent): void => {
@@ -809,16 +1325,17 @@ index a2e67e8..5600c87 100644
      tracker.onEvent(event);
      if (event.type === "step_finished") postSnapshotIfDue();
      if (event.type === "llm_event") {
-@@ -994,7 +1184,7 @@ async function dispatchToRuntime(
+@@ -994,7 +1209,8 @@ async function dispatchToRuntime(
    try {
      const result = await ctx.runtime.runTurn(session, prompt, {
        origin: "telegram",
 -      signal: controller.signal,
 +      signal: turnSignal,
++      ...(beforeRun ? { beforeRun } : {}),
        eventHook,
      });
      // A steer accepted for this turn but never delivered: the chat is
-@@ -1023,7 +1213,8 @@ async function dispatchToRuntime(
+@@ -1023,7 +1239,8 @@ async function dispatchToRuntime(
      if (ctx.liveTurns?.get(ref.key) === tracker) {
        ctx.liveTurns.delete(ref.key);
      }
@@ -828,7 +1345,7 @@ index a2e67e8..5600c87 100644
    }
  
    // Remove the progress indicator before posting the final text so the
-@@ -1038,7 +1229,7 @@ async function dispatchToRuntime(
+@@ -1038,7 +1255,7 @@ async function dispatchToRuntime(
  
    // A cancelled turn's half-written answer is deleted; a failed one's
    // stays above the failure line.
@@ -837,7 +1354,7 @@ index a2e67e8..5600c87 100644
    else if (reply === null) await live?.close();
  
    // Only the agent's natural-language reply gets parse-mode
-@@ -1047,7 +1238,7 @@ async function dispatchToRuntime(
+@@ -1047,7 +1264,7 @@ async function dispatchToRuntime(
    // the operator never confuses runtime telemetry with agent
    // content (and so a stray `<` in an error message can never
    // collide with the HTML grammar).
@@ -846,7 +1363,7 @@ index a2e67e8..5600c87 100644
      await sendText(ctx, ref.target, "Turn cancelled.");
    } else if (reply !== null) {
      const parseMode = ctx.agentReplyParseMode ?? "plain";
-@@ -1197,6 +1388,9 @@ function formatStatus(ref: ChatRef, ctx: InboundContext): string {
+@@ -1197,6 +1414,9 @@ function formatStatus(ref: ChatRef, ctx: InboundContext): string {
      return withTasks(`Pointer references missing session ${entry.current}.`);
    }
    const busy = ctx.runtime.turnController.isBusy(session.id);
@@ -857,14 +1374,15 @@ index a2e67e8..5600c87 100644
      `Session: ${session.id}`,
      `Status: ${session.status}${busy ? " (turn in progress)" : ""}`,
 diff --git a/src/channels/telegram/telegram-channel.test.ts b/src/channels/telegram/telegram-channel.test.ts
-index c7b172d..f977cd8 100644
+index c7b172d..d291565 100644
 --- a/src/channels/telegram/telegram-channel.test.ts
 +++ b/src/channels/telegram/telegram-channel.test.ts
-@@ -406,6 +406,10 @@ describe("TelegramChannel", () => {
+@@ -406,6 +406,11 @@ describe("TelegramChannel", () => {
        "help",
        "status",
        "sessions",
 +      "desktop",
++      "review",
 +      "queue",
 +      "stop",
 +      "result",
@@ -872,23 +1390,33 @@ index c7b172d..f977cd8 100644
        "new",
        "model",
 diff --git a/src/channels/telegram/telegram-channel.ts b/src/channels/telegram/telegram-channel.ts
-index 90b720e..0b2feed 100644
+index 90b720e..15195e1 100644
 --- a/src/channels/telegram/telegram-channel.ts
 +++ b/src/channels/telegram/telegram-channel.ts
-@@ -1,3 +1,4 @@
+@@ -1,3 +1,5 @@
++import type { DesktopReviewBridge } from "./desktop-review.js";
 +import { DesktopRequestQueue } from "./desktop-request-queue.js";
  import { resolve } from "node:path";
  
  import type { ChannelStatus } from "../../runtime/channel-status.js";
-@@ -171,6 +172,7 @@ export class TelegramChannel implements Channel {
+@@ -15,6 +17,7 @@ import {
+ 
+ import { createAttachmentInbox } from "../attachments/inbox.js";
+ import {
++  createDesktopReviewBridge,
+   handleInboundFile,
+   handleInboundText,
+   type InboundContext,
+@@ -171,6 +174,8 @@ export class TelegramChannel implements Channel {
    private readonly settings: TelegramSettingsSink;
    /** `chatKey -> AbortController` for the turn running in that chat/topic. */
    private readonly inflight = new Map<string, AbortController>();
++  private desktopReviews: DesktopReviewBridge | null = null;
 +  private readonly desktopQueues = new Map<string, DesktopRequestQueue>();
    /** Albums still arriving — see `InboundContext.mediaGroups`. */
    private readonly mediaGroups = new Map<string, PendingMediaGroup>();
    /** `chatKey -> status` of the turn running there (ATO-965), for `/status`. */
-@@ -433,6 +435,7 @@ export class TelegramChannel implements Channel {
+@@ -433,6 +438,7 @@ export class TelegramChannel implements Channel {
            this.deps.config.telegram.streamReplies,
          ),
          inflight: this.inflight,
@@ -896,18 +1424,44 @@ index 90b720e..0b2feed 100644
          liveTurns: this.liveTurns,
          statusSnapshot: this.deps.config.statusSnapshot ?? null,
          pendingApprovalTool: (sessionId) =>
-@@ -457,6 +460,10 @@ export class TelegramChannel implements Channel {
+@@ -448,15 +454,26 @@ export class TelegramChannel implements Channel {
+           this.releaseApprovalSession(sessionId),
+         tryClaimForPairing: (u) => this.handlePairingClaim(u),
+       };
++      this.desktopReviews?.close();
++      const reviews = createDesktopReviewBridge(inboundCtx);
++      inboundCtx.desktopReviews = reviews;
++      this.desktopReviews = reviews;
+       bot.setTextHandler((update) => handleInboundText(update, inboundCtx));
+       bot.setFileHandler?.((update) => handleInboundFile(update, inboundCtx));
+-      bot.setCallbackHandler?.((update) => activeBridge.handleCallback(update));
++      bot.setCallbackHandler?.(async (update) => {
++        if (!await reviews.handleCallback(update)) await activeBridge.handleCallback(update);
++      });
+       try {
+         await bot.api.setMyCommands?.([
+           { command: "start", description: "Show help" },
            { command: "help", description: "Show help" },
            { command: "status", description: "What this chat's turn is doing now" },
            { command: "sessions", description: "List sessions by chat" },
 +          { command: "desktop", description: "Connect to a desktop session; /desktop off disconnects" },
++          { command: "review", description: "Review the plan, changes and checks; approve or reject" },
 +          { command: "queue", description: "Queue a request for the linked desktop session" },
 +          { command: "stop", description: "Stop the desktop task and queued remote requests" },
 +          { command: "result", description: "Show the desktop session's analysis or result" },
            {
              command: "switch",
              description: "Continue an existing session here",
-@@ -716,6 +723,8 @@ export class TelegramChannel implements Channel {
+@@ -706,6 +723,8 @@ export class TelegramChannel implements Channel {
+     // No retry may outlive a stop, and a start still awaiting Telegram
+     // must not commit after it (see `stopGeneration`).
+     this.reconnect.cancel();
++    this.desktopReviews?.close();
++    this.desktopReviews = null;
+     this.stopGeneration += 1;
+     if (this.currentState === "disabled" && !this.bot) {
+       // Still cancel pairing — the operator may have started a window
+@@ -716,6 +735,8 @@ export class TelegramChannel implements Channel {
      this.stopRequested = true;
      this.transition("stopping", null);
      this.pairing.cancel();
@@ -917,10 +1471,10 @@ index 90b720e..0b2feed 100644
        try {
          controller.abort();
 diff --git a/src/runtime/composition/runtime-turn-service.test.ts b/src/runtime/composition/runtime-turn-service.test.ts
-index 9c1ef35..f019347 100644
+index 9c1ef35..3d0f986 100644
 --- a/src/runtime/composition/runtime-turn-service.test.ts
 +++ b/src/runtime/composition/runtime-turn-service.test.ts
-@@ -294,12 +294,42 @@ describe("runtime turn ownership recipes", () => {
+@@ -294,12 +294,76 @@ describe("runtime turn ownership recipes", () => {
      const gate = deferred<void>();
      fixture.loop.runTurn.mockImplementationOnce(async (value, options) => { await gate.promise; return result(value, options); });
      const stale = session();
@@ -952,6 +1506,40 @@ index 9c1ef35..f019347 100644
 +    if (kind === "deleted") expect(fixture.rows.has(desktop.id)).toBe(false);
 +  });
 +
++  it("checks a host precondition against the latest state under the lock before inference", async () => {
++    const gate = deferred<void>();
++    const initial = session();
++    fixture.rows.set(initial.id, initial);
++    const blocker = fixture.turnController.enqueue({ sessionId: initial.id, origin: "tui", run: () => gate.promise });
++    const beforeRun = vi.fn(async (fresh: SessionState) => {
++      expect(fresh.stepCount).toBe(7);
++      throw new Error("Review is stale");
++    });
++    const pending = fixture.service.runTurn(initial, "Implement", { beforeRun });
++    const rejected = expect(pending).rejects.toThrow("Review is stale");
++    expect(beforeRun).not.toHaveBeenCalled();
++    fixture.rows.set(initial.id, { ...initial, stepCount: 7 });
++    gate.resolve();
++    await blocker;
++    await rejected;
++    expect(beforeRun).toHaveBeenCalledOnce();
++    expect(fixture.loop.runTurn).not.toHaveBeenCalled();
++    expect(fixture.rows.get(initial.id)?.stepCount).toBe(7);
++  });
++
++  it("rechecks cancellation after an asynchronous host precondition", async () => {
++    const gate = deferred<void>();
++    const beforeRun = vi.fn(() => gate.promise);
++    const abort = new AbortController();
++    const pending = fixture.service.runTurn(session(), "Implement", { beforeRun, signal: abort.signal });
++    const rejected = expect(pending).rejects.toThrow();
++    await vi.waitFor(() => expect(beforeRun).toHaveBeenCalledOnce());
++    abort.abort();
++    gate.resolve();
++    await rejected;
++    expect(fixture.loop.runTurn).not.toHaveBeenCalled();
++  });
++
 +  it("cancels an active desktop turn through the runtime-owned signal", async () => {
 +    fixture.loop.runTurn.mockImplementationOnce(async (value, options) => {
 +      await new Promise<void>(resolve => options.signal!.addEventListener("abort", () => resolve(), { once: true }));
@@ -966,10 +1554,27 @@ index 9c1ef35..f019347 100644
  
    it("queued cancellation never invokes the loop and different sessions remain independent", async () => {
 diff --git a/src/runtime/composition/runtime-turn-service.ts b/src/runtime/composition/runtime-turn-service.ts
-index 9d080f7..4a1a571 100644
+index 9d080f7..5d6a2b1 100644
 --- a/src/runtime/composition/runtime-turn-service.ts
 +++ b/src/runtime/composition/runtime-turn-service.ts
-@@ -826,6 +826,13 @@ export function createRuntimeTurnService(
+@@ -779,6 +779,8 @@ export function createRuntimeTurnService(
+     runOptions: {
+       maxSteps?: number;
+       signal?: AbortSignal;
++      /** Host precondition checked only after acquiring this session's FIFO. */
++      beforeRun?: (fresh: SessionState) => void | Promise<void>;
+       eventHook?: TurnEventHook;
+       origin?: TurnOrigin;
+       providerId?: string;
+@@ -806,6 +808,7 @@ export function createRuntimeTurnService(
+     } = {},
+   ): Promise<RunTurnResult> => {
+     if (runOptions.goal !== undefined) {
++      if (runOptions.beforeRun) throw new Error("Turn preconditions are not supported in goal mode.");
+       const { goal, onGoalProgress, ...turnOptions } = runOptions;
+       return goals.run(
+         session,
+@@ -826,6 +829,13 @@ export function createRuntimeTurnService(
            }),
        );
      }
@@ -983,7 +1588,7 @@ index 9d080f7..4a1a571 100644
      // Before the queue, so a bad pin rejects now rather than after
      // waiting behind whatever is running on the session.
      assertKnownProvider(runOptions.providerId, runOptions.model);
-@@ -833,6 +840,7 @@ export function createRuntimeTurnService(
+@@ -833,6 +843,7 @@ export function createRuntimeTurnService(
      const submission = {
        sessionId: session.id,
        origin,
@@ -991,11 +1596,13 @@ index 9d080f7..4a1a571 100644
        // Re-read the freshest stored session when the queue hands over
        // the lock, not when the caller enqueued: between those moments a
        // turn from another origin (scheduler, HTTP, a TUI thread the
-@@ -846,7 +854,17 @@ export function createRuntimeTurnService(
+@@ -845,8 +856,21 @@ export function createRuntimeTurnService(
+       // parked) falls back to the caller's copy, the pre-existing
        // behaviour.
        run: () =>
-         timeTurn(session.id, origin, () => {
+-        timeTurn(session.id, origin, () => {
 -          const fresh = sessionStore.load(session.id) ?? session;
++        timeTurn(session.id, origin, async () => {
 +          const stored = sessionStore.load(session.id);
 +          // A remote desktop request must not revive a deleted session or enter
 +          // incognito state while waiting for another turn to release the lock.
@@ -1006,10 +1613,43 @@ index 9d080f7..4a1a571 100644
 +            throw new Error("The linked desktop session is no longer available.");
 +          }
 +          const fresh = stored ?? session;
++          runOptions.signal?.throwIfAborted();
++          await runOptions.beforeRun?.(fresh);
++          runOptions.signal?.throwIfAborted();
 +          if (origin === "tui") fresh.metadata.desktopTelegramBridge = true;
            // ATO-42: on the copy the turn runs and saves, never before the lock.
            applySessionProject(fresh, runOptions.project);
            return executeTurn(fresh, userMessage, runOptions);
+diff --git a/src/runtime/docs/lifecycle.md b/src/runtime/docs/lifecycle.md
+index 4ba9fb8..1de583c 100644
+--- a/src/runtime/docs/lifecycle.md
++++ b/src/runtime/docs/lifecycle.md
+@@ -11,6 +11,12 @@ Public runTurn enqueues; executeTurn is for a caller that already holds the lock
+ 
+ Steering enters a running turn at its next checkpoint. A false return means the message was not accepted; each ingress must apply its documented queue/new-turn policy rather than drop it. Query isBusy is not an atomic steering acceptance test.
+ 
++A local host may supply `runTurn.beforeRun(fresh)` to check a precondition
++under the session FIFO before inference or mutation. A rejection prevents the
++turn from starting; cancellation is checked before and after this awaited hook.
++Goal mode refuses this option rather than silently bypassing it. The hook does
++not lock external files or replace ordinary tool permission enforcement.
++
+ ## Resources
+ 
+ Bootstrap owns provider/slot wiring, stores, tool registration, background jobs and channels. Preserve live getters for provider/model/tool changes. Reflection and other sub-calls use separate slot/provider posture; workers are ephemeral, non-persistent and cannot wait for invisible interactive approval.
+diff --git a/src/runtime/runtime-contract.ts b/src/runtime/runtime-contract.ts
+index 0252a4c..b437716 100644
+--- a/src/runtime/runtime-contract.ts
++++ b/src/runtime/runtime-contract.ts
+@@ -511,6 +511,8 @@ export interface AgentRuntime {
+     options?: {
+       maxSteps?: number;
+       signal?: AbortSignal;
++      /** Local host precondition, awaited under the session lock before inference or mutations. */
++      beforeRun?: (fresh: SessionState) => void | Promise<void>;
+       eventHook?: TurnEventHook;
+       origin?: TurnOrigin;
+       providerId?: string;
 diff --git a/src/runtime/turn-controller.test.ts b/src/runtime/turn-controller.test.ts
 index ba3335f..3c83198 100644
 --- a/src/runtime/turn-controller.test.ts

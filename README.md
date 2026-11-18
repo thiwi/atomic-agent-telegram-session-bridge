@@ -129,6 +129,8 @@ username, Telegram owner ID, session database, user configuration, or credential
 | `/desktop <session-id>` | Connect to a specific session. When several are running, the bot lists IDs and project paths for selection. |
 | `/status` or “How far along are you?” | Read status, completed steps, current plan step, last stored result, and outstanding remote request count. |
 | `/result` or “Show me the result of your analysis” | Read the final answer to the latest request, or a current plan snapshot while work continues. |
+| `/review` | Show the latest proposed plan, current Git change summary and recorded verification evidence, with approve/reject buttons. |
+| `/review diff` | Include the tracked-file patch in a new review. |
 | `/queue <request>` | Add a follow-up to the linked session's execution queue. Several requests execute in arrival order. |
 | `/queue` | Show the number of outstanding Telegram requests and command usage. |
 | `/cancel` | Cancel outstanding requests submitted through Telegram. |
@@ -168,6 +170,49 @@ Completed edits and external effects remain in place. Review the resulting
 project state before requesting new work. If a session belongs to another
 process or has an interrupted active turn, continue it in the current terminal
 before sending another remote task.
+
+## Review and approve a plan
+
+Ask the desktop agent to prepare an implementation plan and wait for its final
+answer. In the paired private chat, connect with `/desktop`, then send:
+
+```text
+/review
+```
+
+The bridge shows the latest final answer as the proposed plan, the repository's
+current staged/unstaged change summary, untracked file names, and retained
+verification commands/results from the latest request. It does not rerun tests
+or treat a successful tool call as proof that tests passed. Missing or truncated
+results are labelled explicitly. Changes include the entire repository and
+are not attributed solely to the agent. `/review diff` includes the tracked-file
+patch and replaces the previous review's buttons.
+
+- **Approve plan** queues implementation of the exact reviewed plan in the same
+  session. Existing tool permissions and approval requirements still apply.
+- **Reject plan** dismisses that review. It runs no implementation and does not
+  revert files that were already changed.
+
+Only an idle linked session without outstanding Telegram work can be reviewed.
+Buttons are restricted to the paired owner's private chat and original message,
+work once, and expire in 30 minutes. New reviews, channel reconnects and shutdowns
+invalidate old buttons. Session history and repository contents are checked again
+on approval and at the runtime execution boundary. Changed or unavailable
+snapshots require a new `/review`. Other commands such as `/queue` remain normal
+explicit requests; this feature does not impose a global review policy.
+
+Review reads Git without a shell, external diff drivers, text converters or
+optional index writes. Reports mask recognized credentials and secrets known
+from the environment. Review your own output before sharing sensitive projects;
+masking cannot recognize every possible secret.
+
+Review limits: 10,000 tracked/untracked files, 64 MiB of file content, 2 MiB per
+Git command, 10 seconds per Git command, and 32,000 characters for the complete
+report. Symlinks, submodules and incomplete/oversized snapshots are refused.
+Ignored untracked files are excluded. Untracked file bytes contribute to the
+freshness check but are not included in the displayed patch. External programs
+can still edit files after the check; this is not a filesystem transaction.
+Use a smaller worktree or inspect a large project locally if these limits apply.
 
 ## Access and privacy
 

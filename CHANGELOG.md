@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add read-only `/review [diff]` with recorded check evidence and one-use plan approval/rejection buttons.
+- Check session and Git freshness on approval and under the runtime lock before implementation.
 - Pin current official CI actions, disable persisted checkout credentials, bound job runtime and cancel superseded runs.
 - Rename bridge modules and new session markers to desktop-neutral names while reading legacy markers.
 - Remove the platform-specific connection alias; use `/desktop` on every host.
