@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Pin current official CI actions, disable persisted checkout credentials, bound job runtime and cancel superseded runs.
 - Rename bridge modules and new session markers to desktop-neutral names while reading legacy markers.
 - Remove the platform-specific connection alias; use `/desktop` on every host.
 - Serialize desktop attachments with text follow-ups instead of bypassing the queue.
