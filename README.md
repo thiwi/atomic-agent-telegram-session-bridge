@@ -57,7 +57,8 @@ node scripts/run.mjs tui
 
 The installer clones the pinned upstream tag into `runtime/`, verifies its exact
 commit, checks and applies the patch, installs the upstream lockfile, then builds
-Atomic. It creates an ignored `.runtime-path.json` only after a successful build.
+Atomic. Its source checkout uses LF line endings on every platform so upstream
+archive checksum validation also works on Windows. It creates an ignored `.runtime-path.json` only after a successful build.
 
 To choose another **new** runtime directory:
 

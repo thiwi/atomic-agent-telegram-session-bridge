@@ -7,7 +7,7 @@ try {
   const target = targetArgument(process.argv.slice(2));
   if (existsSync(target)) throw new Error("The target already exists. Choose a new directory with --target.");
   mkdirSync(dirname(target), { recursive: true });
-  run("git", ["clone", "--depth", "1", "--branch", upstream.tag, upstream.url, target]);
+  run("git", ["-c", "core.autocrlf=false", "clone", "--config", "core.autocrlf=false", "--depth", "1", "--branch", upstream.tag, upstream.url, target]);
   if (output("git", ["rev-parse", "HEAD"], target) !== upstream.commit) {
     throw new Error("The upstream revision does not match the supported commit. No patch was applied.");
   }
