@@ -10,6 +10,17 @@ reviewable patch against **v0.8.0**, commit
 store, per-session FIFO, Telegram pairing, approval controls, and outbound
 message handling.
 
+## Video demo
+
+[![Watch the 46-second Atomic Session Bridge demo](docs/media/atomic-bridge-demo-poster.png)](https://github.com/thiwi/atomic-agent-telegram-session-bridge/raw/refs/heads/main/docs/media/atomic-bridge-demo.mp4)
+
+[Watch or download the MP4](docs/media/atomic-bridge-demo.mp4) · 1080p · English · Silent
+
+Start on desktop, check progress in Telegram, review and approve a plan, then
+inspect the result. This is an illustrative demo with recreated interfaces and
+fictional content; it contains no personal chats, bot credentials or user data.
+Timing is condensed.
+
 ## Example
 
 Start a task in the patched Atomic terminal:
