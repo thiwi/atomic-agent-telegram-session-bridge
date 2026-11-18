@@ -2,9 +2,14 @@
 
 ## Unreleased
 
-- Rename session bridge modules, functions, and new session markers to desktop-neutral names.
-- Preserve existing session markers and the /mac alias for compatibility.
-- Add a regression test for sessions created before the naming migration.
+- Rename bridge modules and new session markers to desktop-neutral names while reading legacy markers.
+- Remove the platform-specific connection alias; use `/desktop` on every host.
+- Serialize desktop attachments with text follow-ups instead of bypassing the queue.
+- Revalidate queued sessions before dispatch so removed sessions are not restored.
+- Limit outstanding remote requests to 20 per chat with an explicit rejection.
+- Continue draining the queue if an error reporter fails.
+- Release remote approval routing only when the remote turn acquired it.
+- Add regression tests and document beta status and queue limitations.
 
 ## 0.1.0
 

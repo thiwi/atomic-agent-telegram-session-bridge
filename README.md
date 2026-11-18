@@ -31,6 +31,13 @@ Progress queries remain available while the desktop task or a queued request
 runs. Follow-ups execute in the same session with its latest context. A queued
 request's final answer is delivered in Telegram.
 
+## Release status
+
+This is an experimental extension for the pinned Atomic v0.8.0 revision,
+distributed as a reviewed source patch rather than an official Atomic plugin.
+It is suitable for a beta release; pending work is not restart-safe, and remote
+control requires the terminal and Telegram adapter to share one process.
+
 ## Requirements and compatibility
 
 - Node.js **25.7 or newer**, including npm. Node 26 is used in CI.
@@ -41,7 +48,8 @@ request's final answer is delivered in Telegram.
 
 The extension uses portable Node/TypeScript APIs. Source modules, functions, and
 new session markers use desktop-neutral names. Existing sessions with the legacy
-`macTelegramBridge` marker remain readable, and `/mac` remains a command alias. It has no Homebrew, shell,
+`macTelegramBridge` marker remain readable. The connection command is `/desktop`.
+It has no Homebrew, shell,
 Keychain, MLX, absolute home directory, or Apple hardware dependency.
 CI installs the pinned upstream source and runs the checks on macOS, Linux,
 and Windows. Atomic's own model, browser, and native package requirements also
@@ -119,7 +127,6 @@ username, Telegram owner ID, session database, user configuration, or credential
 | --- | --- |
 | `/desktop` | Connect to the only running eligible desktop session. If all are idle, select the most recently updated eligible session. |
 | `/desktop <session-id>` | Connect to a specific session. When several are running, the bot lists IDs and project paths for selection. |
-| `/mac` | Backward-compatible alias for `/desktop`, on every platform. |
 | `/status` or “How far along are you?” | Read status, completed steps, current plan step, last stored result, and outstanding remote request count. |
 | `/result` or “Show me the result of your analysis” | Read the final answer to the latest request, or a current plan snapshot while work continues. |
 | `/queue <request>` | Add a follow-up to the linked session's execution queue. Several requests execute in arrival order. |
@@ -145,6 +152,12 @@ connect to another process's in-memory turn queue.
 Status is a read-only snapshot of the last saved work step. A long model response
 or tool call can leave the snapshot unchanged until the next checkpoint.
 Reading status or results does not ask the model to produce an estimate.
+
+Up to 20 Telegram requests can be outstanding per chat, including attachments.
+Additional requests are rejected explicitly. Each accepted request stays tied to
+its original session, even after `/new` or `/switch`; use `/cancel` before changing
+conversations if you want pending work discarded. Deleted or ineligible sessions
+are checked again before execution and cannot be recreated by a queued request.
 
 Pending follow-ups are kept in process memory. Closing Atomic or restarting its
 Telegram channel cancels outstanding remote requests. Already completed turns
