@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Rename session bridge modules, functions, and new session markers to desktop-neutral names.
+- Preserve existing session markers and the /mac alias for compatibility.
+- Add a regression test for sessions created before the naming migration.
+
 ## 0.1.0
 
 - Link a paired private Telegram chat to a terminal session with /desktop.

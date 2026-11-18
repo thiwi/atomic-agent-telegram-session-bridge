@@ -39,7 +39,9 @@ request's final answer is delivered in Telegram.
 - A Telegram bot and an account paired as its owner.
 - The terminal process stays running and has network access to Telegram.
 
-The extension uses portable Node/TypeScript APIs. It has no Homebrew, shell,
+The extension uses portable Node/TypeScript APIs. Source modules, functions, and
+new session markers use desktop-neutral names. Existing sessions with the legacy
+`macTelegramBridge` marker remain readable, and `/mac` remains a command alias. It has no Homebrew, shell,
 Keychain, MLX, absolute home directory, or Apple hardware dependency.
 CI installs the pinned upstream source and runs the checks on macOS, Linux,
 and Windows. Atomic's own model, browser, and native package requirements also
