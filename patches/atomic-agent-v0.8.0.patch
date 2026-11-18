@@ -1,0 +1,937 @@
+diff --git a/src/channels/docs/adapters.md b/src/channels/docs/adapters.md
+index 41f6665..fe5e25a 100644
+--- a/src/channels/docs/adapters.md
++++ b/src/channels/docs/adapters.md
+@@ -31,3 +31,38 @@ Microsoft Teams ([msteams-channel](../msteams/msteams-channel.ts), ATO-506) uses
+ Shared model commands currently import provider persistence from TUI; stage 02 moves that responsibility. Do not describe this boundary as already repaired.
+ 
+ Sources: [Telegram](../telegram/telegram-channel.ts), [Discord](../discord/discord-channel.ts), [Swarm](../swarm/swarm-registry.ts), [model commands](../model-command.ts), [backoff](../reconnect-backoff.ts). Tests: [Telegram](../telegram/telegram-channel.test.ts), [cron](../telegram/cron-command.test.ts), [Discord](../discord/discord-channel.test.ts), [model commands](../telegram/inbound-model-command.test.ts).
++
++## Desktop session continuation
++
++TUI turns mark their session with `metadata.macTelegramBridge` inside the FIFO
++callback, after reloading saved state. The field retains its original name for
++compatibility; the bridge uses platform-neutral runtime APIs. The paired owner's
++private Telegram DM may connect through `/desktop [session-id]` (`/mac` is an
++alias). With no ID it picks the only running marked session, or the most recent
++marked session when all are idle. Multiple running sessions require an explicit
++ID. Incognito sessions and other channels are excluded.
++
++`/status` and `/result` read the selected session without inference. English
++natural-language equivalents include “How far along are you?” and “Show me the
++result of your analysis”. Legacy German input phrases remain accepted. Control
++messages are English, and follow-up turns request English replies. Stored answers
++and plan text are returned verbatim, preserving the original analysis.
++
++Other messages and `/queue <request>` use the same session's FIFO `runtime.runTurn`,
++waiting for current work and reloading saved context at the queue boundary.
++Several requests may be outstanding per chat. A serial queue tracks their abort
++signals and size while status/result messages bypass execution. Approvals bind on the remote turn's first event and
++release on its terminal event and in cleanup. Status reads and queued requests
++do not move a desktop turn's approval route. A stored active turn that this
++runtime does not own must be resumed in this terminal before a remote follow-up.
++
++`/desktop off` or `/new` returns the private chat to its own Telegram conversation.
++The terminal process must stay running; this feature does not connect separate
++Atomic processes or start a desktop session on another computer.
++
++`/cancel` cancels outstanding Telegram requests. `/stop` also calls the runtime
++turn controller's cancellation hook for the currently owning desktop turn.
++Hooks are installed only while a submission owns its session and removed at
++settlement. The runtime combines its cancellation signal with the caller's
++signal. Tool cancellation remains cooperative, preserving completed effects.
++Channel shutdown cancels all remote queues before stopping its active turns.
+diff --git a/src/channels/telegram/desktop-request-queue.test.ts b/src/channels/telegram/desktop-request-queue.test.ts
+new file mode 100644
+index 0000000..4f73342
+--- /dev/null
++++ b/src/channels/telegram/desktop-request-queue.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it, vi } from "vitest";
++import { DesktopRequestQueue } from "./desktop-request-queue.js";
++
++describe("desktop request queue", () => {
++  it("runs requests in FIFO order and keeps accepting work while one runs", async () => {
++    const queue = new DesktopRequestQueue("desktop");
++    const order: string[] = [];
++    let release!: () => void;
++    const onError = vi.fn();
++    queue.enqueue(async () => {
++      order.push("first start");
++      await new Promise<void>(resolve => { release = resolve; });
++      order.push("first end");
++    }, onError);
++    queue.enqueue(async () => { order.push("second"); }, onError);
++    await vi.waitFor(() => expect(queue.active).toBe(true));
++    expect(queue.size).toBe(2);
++    release();
++    await queue.settled();
++    expect(order).toEqual(["first start", "first end", "second"]);
++    expect(queue.size).toBe(0);
++    expect(onError).not.toHaveBeenCalled();
++  });
++
++  it("cancels the active request and prevents queued requests from starting", async () => {
++    const queue = new DesktopRequestQueue("desktop");
++    const skipped = vi.fn();
++    const onError = vi.fn();
++    queue.enqueue(signal => new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })), onError);
++    queue.enqueue(skipped, onError);
++    await vi.waitFor(() => expect(queue.active).toBe(true));
++    expect(queue.cancelAll()).toBe(2);
++    await queue.settled();
++    expect(skipped).not.toHaveBeenCalled();
++    expect(queue.size).toBe(0);
++  });
++
++  it("continues draining after a failed request", async () => {
++    const queue = new DesktopRequestQueue("desktop");
++    const onError = vi.fn();
++    const next = vi.fn(async () => {});
++    queue.enqueue(async () => { throw new Error("failed"); }, onError);
++    queue.enqueue(next, onError);
++    await queue.settled();
++    expect(onError).toHaveBeenCalledOnce();
++    expect(next).toHaveBeenCalledOnce();
++  });
++});
+diff --git a/src/channels/telegram/desktop-request-queue.ts b/src/channels/telegram/desktop-request-queue.ts
+new file mode 100644
+index 0000000..dedd75d
+--- /dev/null
++++ b/src/channels/telegram/desktop-request-queue.ts
+@@ -0,0 +1,35 @@
++/** Serial remote requests for one linked desktop session. Runtime FIFO owns actual execution. */
++export class DesktopRequestQueue {
++  private tail: Promise<void> = Promise.resolve();
++  private readonly controllers = new Set<AbortController>();
++  active = false;
++
++  constructor(readonly sessionId: string) {}
++
++  get size(): number { return this.controllers.size; }
++
++  enqueue(run: (signal: AbortSignal) => Promise<void>, onError: (error: unknown) => void): void {
++    const controller = new AbortController();
++    this.controllers.add(controller);
++    const next = this.tail.then(async () => {
++      if (controller.signal.aborted) return;
++      this.active = true;
++      try {
++        await run(controller.signal);
++      } catch (error) {
++        if (!controller.signal.aborted) onError(error);
++      } finally {
++        this.active = false;
++      }
++    });
++    this.tail = next.finally(() => { this.controllers.delete(controller); });
++  }
++
++  cancelAll(): number {
++    const count = this.controllers.size;
++    for (const controller of this.controllers) controller.abort();
++    return count;
++  }
++
++  settled(): Promise<void> { return this.tail; }
++}
+diff --git a/src/channels/telegram/inbound-handler.test.ts b/src/channels/telegram/inbound-handler.test.ts
+index f76e2a2..0290513 100644
+--- a/src/channels/telegram/inbound-handler.test.ts
++++ b/src/channels/telegram/inbound-handler.test.ts
+@@ -67,6 +67,7 @@ function makeFakeRuntime(opts: FakeRuntimeOpts = {}): {
+     },
+     sessionStore: {
+       load: (id: string) => sessions.find((s) => s.id === id) ?? null,
++      listRecent: () => [...sessions].reverse(),
+     },
+     turnController: {
+       isBusy: (id: string) => busy.has(id),
+@@ -218,6 +219,153 @@ describe("handleInboundText", () => {
+     rmSync(dir, { recursive: true, force: true });
+   });
+ 
++  it("links the owner's private chat to a Mac session and reads status without inference", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work/project", metadata: { macTelegramBridge: true } });
++    mac.plan = { items: [{ step: "Analyse views", status: "in_progress" }], updatedAt: 1 };
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [mac] });
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("Wie weit bist du?"), ctx);
++    expect(pointer.get(CHAT_KEY).current).toBe("mac-1");
++    expect(api.sent.at(-1)?.text).toContain("Analyse views");
++    expect(api.sent.at(-1)?.text).toContain("/work/project");
++    expect(calls).toHaveLength(0);
++  });
++
++  it("returns the Mac analysis and never substitutes a previous request's answer", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    mac.turns = [{ kind: "user", text: "Analyse", at: 1 }, { kind: "assistant_reply", text: "Refactor these views.", at: 2 }];
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [mac] });
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("/mac mac-1"), ctx);
++    await handleInboundText(makeUpdate("Zeige mir das Ergebnis deiner Analyse"), ctx);
++    expect(api.sent.at(-1)?.text).toBe("Refactor these views.");
++    mac.turns.push({ kind: "user", text: "Another analysis", at: 3 });
++    await handleInboundText(makeUpdate("/result"), ctx);
++    expect(api.sent.at(-1)?.text).not.toContain("Refactor these views.");
++    expect(calls).toHaveLength(0);
++  });
++
++  it("rejects non-owners, groups, incognito and other channel sessions", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    const discord = createEmptySessionState({ id: "discord", workingDir: "/work", metadata: { discordChannel: true } });
++    const privateSession = {
++      ...createEmptySessionState({ id: "private", workingDir: "/work", metadata: { macTelegramBridge: true } }),
++      incognito: { since: 1, owner: "test" },
++    };
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [mac, discord, privateSession] });
++    const api = makeFakeApi();
++    const ctx = { ...makeContext(runtime, api, pointer, OWNER, join(dir, "inbox")), botIdentity: BOT };
++    await handleInboundText(makeUpdate("/mac mac-1", NON_OWNER), ctx);
++    expect(api.sent).toHaveLength(0);
++    await handleInboundText(makeUpdate("/mac@atomic_bot mac-1", OWNER, "group"), ctx);
++    expect(pointer.get(CHAT_KEY).current).toBeNull();
++    await handleInboundText(makeUpdate("/mac discord"), ctx);
++    await handleInboundText(makeUpdate("/mac private"), ctx);
++    expect(pointer.get(CHAT_KEY).current).toBeNull();
++    expect(calls).toHaveLength(0);
++  });
++
++  it("does not guess between two running Mac sessions", async () => {
++    const sessions = ["mac-1", "mac-2"].map(id => createEmptySessionState({ id, workingDir: "/work", metadata: { macTelegramBridge: true } }));
++    const { runtime } = makeFakeRuntime({ initialSessions: sessions });
++    runtime.turnController.isBusy = () => true;
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("/mac"), ctx);
++    expect(pointer.get(CHAT_KEY).current).toBeNull();
++    expect(api.sent.at(-1)?.text).toContain("mac-1");
++    expect(api.sent.at(-1)?.text).toContain("mac-2");
++  });
++
++  it("queues a follow-up on the same Mac session without stealing the current approval route", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    const { runtime } = makeFakeRuntime({ initialSessions: [mac] });
++    runtime.turnController.isBusy = () => true;
++    let runOptions: Parameters<AgentRuntime["runTurn"]>[2];
++    let finish!: () => void;
++    runtime.runTurn = vi.fn(async (_session, prompt, options) => {
++      expect(_session.id).toBe(mac.id);
++      expect(prompt).toBe("Respond in English.\n\nImplementiere den Plan");
++      runOptions = options;
++      await new Promise<void>(resolve => { finish = resolve; });
++      return { session: mac, reason: "reply" as const, stepCount: 1 };
++    });
++    const api = makeFakeApi();
++    const ctx: InboundContext = {
++      ...makeContext(runtime, api, pointer, OWNER, join(dir, "inbox")),
++      ensureApprovalSession: vi.fn(), releaseApprovalSession: vi.fn(),
++    };
++    await handleInboundText(makeUpdate("/mac mac-1"), ctx);
++    const pending = handleInboundText(makeUpdate("Implementiere den Plan"), ctx);
++    await vi.waitFor(() => expect(runtime.runTurn).toHaveBeenCalledOnce());
++    expect(ctx.ensureApprovalSession).not.toHaveBeenCalled();
++    expect(api.sent.some(item => item.text.includes("Request queued"))).toBe(true);
++    await handleInboundText(makeUpdate("/status"), ctx);
++    expect(api.sent.at(-1)?.text).toContain("Desktop session");
++    runOptions?.eventHook?.({ type: "step_started", stepIndex: 0 });
++    expect(ctx.ensureApprovalSession).toHaveBeenCalledWith(mac.id, { chatId: CHAT });
++    finish();
++    await pending;
++    await ctx.desktopQueues?.get(CHAT_KEY)?.settled();
++    expect(ctx.releaseApprovalSession).toHaveBeenCalledWith(mac.id);
++  });
++
++  it("/queue accepts multiple desktop requests while /status remains available", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    const { runtime } = makeFakeRuntime({ initialSessions: [mac] });
++    const prompts: string[] = [];
++    let release!: () => void;
++    runtime.runTurn = vi.fn(async (_session, prompt) => {
++      prompts.push(prompt);
++      if (prompts.length === 1) await new Promise<void>(resolve => { release = resolve; });
++      return { session: mac, reason: "reply" as const, stepCount: 1 };
++    });
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("/desktop mac-1"), ctx);
++    await handleInboundText(makeUpdate("/queue Implement the plan"), ctx);
++    await handleInboundText(makeUpdate("/queue Review the changes"), ctx);
++    await handleInboundText(makeUpdate("How far along are you?"), ctx);
++    expect(prompts).toHaveLength(1);
++    expect(api.sent.at(-1)?.text).toContain("Outstanding Telegram requests: 2");
++    release();
++    await ctx.desktopQueues?.get(CHAT_KEY)?.settled();
++    expect(prompts).toEqual(["Respond in English.\n\nImplement the plan", "Respond in English.\n\nReview the changes"]);
++  });
++
++  it("/stop cancels the desktop task and clears pending remote work without running it", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [mac] });
++    const cancel = vi.spyOn(runtime.turnController, "isBusy").mockReturnValue(true);
++    const stop = vi.fn(() => true);
++    runtime.turnController.cancelCurrent = stop;
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("/desktop mac-1"), ctx);
++    // Queue is accepted synchronously but its body starts in a microtask.
++    const queued = handleInboundText(makeUpdate("/queue Do not run this"), ctx);
++    await handleInboundText(makeUpdate("/stop"), ctx);
++    await queued;
++    await ctx.desktopQueues?.get(CHAT_KEY)?.settled();
++    expect(stop).toHaveBeenCalledWith(mac.id);
++    expect(calls).toHaveLength(0);
++    expect(api.sent.some(message => message.text.includes("Stop requested"))).toBe(true);
++    cancel.mockRestore();
++  });
++
++  it("disconnects the Mac link and returns to a separate Telegram session", async () => {
++    const mac = createEmptySessionState({ id: "mac-1", workingDir: "/work", metadata: { macTelegramBridge: true } });
++    const { runtime, calls } = makeFakeRuntime({ initialSessions: [mac] });
++    const api = makeFakeApi();
++    const ctx = makeContext(runtime, api, pointer, OWNER, join(dir, "inbox"));
++    await handleInboundText(makeUpdate("/mac mac-1"), ctx);
++    await handleInboundText(makeUpdate("/mac off"), ctx);
++    await handleInboundText(makeUpdate("Hello"), ctx);
++    expect(calls[0]?.sessionId).not.toBe(mac.id);
++  });
++
+   it("drops group-chat messages when the bot identity is unknown", async () => {
+     // Without `getMe` there is no way to tell whether a group message
+     // was addressed to us, so the safe answer is to stay quiet.
+diff --git a/src/channels/telegram/inbound-handler.ts b/src/channels/telegram/inbound-handler.ts
+index a2e67e8..6654dca 100644
+--- a/src/channels/telegram/inbound-handler.ts
++++ b/src/channels/telegram/inbound-handler.ts
+@@ -1,3 +1,5 @@
++import { DesktopRequestQueue } from "./desktop-request-queue.js";
++import { isMacSession, macReadCommand, macResult, macStatus } from "./mac-session-bridge.js";
+ import type { AgentLoopEvent } from "../../agent/agent-contract.js";
+ import {
+   buildStatusSnapshot,
+@@ -123,6 +125,7 @@ export interface TelegramBotIdentity {
+  * across messages and only the `inflight` map mutates.
+  */
+ export interface InboundContext {
++  desktopQueues?: Map<string, DesktopRequestQueue>;
+   runtime: AgentRuntime;
+   api: TelegramApi;
+   sessionPointer: TelegramSessionPointer;
+@@ -295,6 +298,11 @@ function helpText(ctx: InboundContext): string {
+     "Commands:\n" +
+     "  /start, /help — this message\n" +
+     "  /status — what this chat's turn is doing now (plan, last result, blocked, time), its session, and running background tasks\n" +
++    "  /desktop [session-id] — connect this private chat to a desktop session; /desktop off disconnects\n" +
++    "  /mac — alias for /desktop\n" +
++    "  /queue <request> — queue a follow-up for the linked desktop session\n" +
++    "  /stop — cancel the linked desktop task and its queued Telegram requests\n" +
++    "  /result — show the desktop session's latest answer or analysis progress\n" +
+     "  /sessions — every chat this bot has a session for\n" +
+     "  /switch <session-id> — point this chat at an existing session\n" +
+     "  /new — rotate this chat to a fresh session (current one is archived)\n" +
+@@ -375,6 +383,33 @@ export async function handleInboundText(
+     await handleSlashCommand(text, ref, ctx, fromId);
+     return;
+   }
++  const readCommand = macReadCommand(text);
++  let current = ctx.sessionPointer.get(ref.key).current;
++  let linked = current ? ctx.runtime.sessionStore.load(current) : null;
++  if (ref.isPrivate && readCommand && !linked?.metadata?.macTelegramBridge) {
++    await connectMacSession(undefined, ref, ctx);
++    current = ctx.sessionPointer.get(ref.key).current;
++    linked = current ? ctx.runtime.sessionStore.load(current) : null;
++    if (!linked || !isMacSession(linked)) return;
++  }
++  if (linked && isMacSession(linked)) {
++    if (!ref.isPrivate) {
++      await sendText(ctx, ref.target, "Desktop sessions are available only in the paired owner’s private chat.");
++      return;
++    }
++    if (readCommand) {
++      const busy = ctx.runtime.turnController.isBusy(linked.id);
++      await sendText(ctx, ref.target, readCommand === "status" ? desktopStatus(linked, ref, ctx) : macResult(linked, busy));
++      return;
++    }
++    if (!ctx.runtime.turnController.isBusy(linked.id) &&
++        ["running", "awaiting_approval", "awaiting_llm"].includes(linked.status)) {
++      await sendText(ctx, ref.target, "This desktop session is active in another Atomic process or has an interrupted turn. Continue it in this terminal process before sending a follow-up.");
++      return;
++    }
++    await queueDesktopRequest(text, ref, ctx, linked);
++    return;
++  }
+   // Who is speaking, and in which group/topic. Skipped in a DM: a
+   // private chat only ever reaches this line for the single configured
+   // `ownerUserId`, so the block would restate a constant on every turn
+@@ -726,6 +761,47 @@ async function handleSlashCommand(
+     case "/help":
+       await sendText(ctx, ref.target, helpText(ctx));
+       return;
++    case "/queue": {
++      const session = linkedDesktop(ref, ctx);
++      if (!session) {
++        await sendText(ctx, ref.target, "Connect a desktop session first with /desktop.");
++        return;
++      }
++      const request = text.slice(verb!.length).trim();
++      if (!request) {
++        const count = ctx.desktopQueues?.get(ref.key)?.size ?? 0;
++        await sendText(ctx, ref.target, `Desktop requests outstanding: ${count}. Usage: /queue <request>`);
++        return;
++      }
++      await queueDesktopRequest(request, ref, ctx, session);
++      return;
++    }
++    case "/stop": {
++      const session = linkedDesktop(ref, ctx);
++      if (!session) {
++        await sendText(ctx, ref.target, "Connect a desktop session first with /desktop.");
++        return;
++      }
++      const count = ctx.desktopQueues?.get(ref.key)?.cancelAll() ?? 0;
++      const stopped = ctx.runtime.turnController.cancelCurrent?.(session.id) ?? false;
++      await sendText(ctx, ref.target,
++        `${stopped ? "Stop requested for the running desktop task." : "No cancellable desktop task is running in this process."} Cancelled ${count} outstanding Telegram request(s). Already completed edits are kept.`);
++      return;
++    }
++    case "/desktop":
++    case "/mac":
++      await connectMacSession(rest[0], ref, ctx);
++      return;
++    case "/result": {
++      const id = ctx.sessionPointer.get(ref.key).current;
++      const session = id ? ctx.runtime.sessionStore.load(id) : null;
++      if (!ref.isPrivate || !session || !isMacSession(session)) {
++        await sendText(ctx, ref.target, "Connect a desktop session first with /desktop.");
++        return;
++      }
++      await sendText(ctx, ref.target, macResult(session, ctx.runtime.turnController.isBusy(session.id)));
++      return;
++    }
+     case "/status":
+       await sendText(ctx, ref.target, formatStatus(ref, ctx));
+       return;
+@@ -786,6 +862,12 @@ async function handleSlashCommand(
+       return;
+     }
+     case "/cancel": {
++      const queued = ctx.desktopQueues?.get(ref.key);
++      if (queued?.size) {
++        const count = queued.cancelAll();
++        await sendText(ctx, ref.target, `Cancelled ${count} outstanding Telegram request(s). Use /stop to stop the original desktop task as well.`);
++        return;
++      }
+       const controller = ctx.inflight.get(ref.key);
+       if (!controller) {
+         await sendText(ctx, ref.target, "No turn in progress in this chat.");
+@@ -800,6 +882,85 @@ async function handleSlashCommand(
+   }
+ }
+ 
++function desktopStatus(session: SessionState, ref: ChatRef, ctx: InboundContext): string {
++  const queued = ctx.desktopQueues?.get(ref.key)?.size ?? 0;
++  return `${macStatus(session, ctx.runtime.turnController.isBusy(session.id))}\nOutstanding Telegram requests: ${queued}`;
++}
++
++function linkedDesktop(ref: ChatRef, ctx: InboundContext): SessionState | null {
++  const id = ctx.sessionPointer.get(ref.key).current;
++  const session = id ? ctx.runtime.sessionStore.load(id) : null;
++  return ref.isPrivate && session && isMacSession(session) ? session : null;
++}
++
++async function queueDesktopRequest(text: string, ref: ChatRef, ctx: InboundContext, session: SessionState): Promise<void> {
++  if (!ctx.runtime.turnController.isBusy(session.id) &&
++      ["running", "awaiting_approval", "awaiting_llm"].includes(session.status)) {
++    await sendText(ctx, ref.target, "Continue this active or interrupted session in this terminal process before queuing a follow-up.");
++    return;
++  }
++  const queues = ctx.desktopQueues ??= new Map<string, DesktopRequestQueue>();
++  let queue = queues.get(ref.key);
++  if (!queue || queue.sessionId !== session.id) {
++    if (queue?.size) {
++      await sendText(ctx, ref.target, "The previous session still has queued requests. Use /cancel first.");
++      return;
++    }
++    queue = new DesktopRequestQueue(session.id);
++    queues.set(ref.key, queue);
++  }
++  const selectedQueue = queue;
++  queue.enqueue(async signal => {
++    // Capture the session at acceptance, so switching chats never redirects a queued request.
++    if (signal.aborted) return;
++    await dispatchToRuntime(text, ref, ctx, null, session, signal);
++  }, error => {
++    ctx.logger.warn("desktop Telegram follow-up failed", { error: scrubErrorMessage(error instanceof Error ? error.message : String(error)) });
++    void sendText(ctx, ref.target, "The queued desktop request failed. Check /status before retrying.");
++  });
++  await sendText(ctx, ref.target,
++    `Request queued for desktop session ${session.id}. Outstanding Telegram requests: ${selectedQueue.size}. It will run after earlier work. Use /status to check progress.`);
++}
++
++async function connectMacSession(id: string | undefined, ref: ChatRef, ctx: InboundContext): Promise<void> {
++  if (!ref.isPrivate) {
++    await sendText(ctx, ref.target, "Desktop sessions are available only in the paired owner’s private chat.");
++    return;
++  }
++  if (ctx.inflight.has(ref.key) || (ctx.desktopQueues?.get(ref.key)?.size ?? 0) > 0) {
++    await sendText(ctx, ref.target, "A Telegram request is still running or queued. Wait for it to finish or use /cancel.");
++    return;
++  }
++  if (id === "off") {
++    const current = ctx.sessionPointer.get(ref.key).current;
++    if (current) ctx.releaseApprovalSession?.(current);
++    ctx.sessionPointer.rotate(ref.key);
++    await sendText(ctx, ref.target, "Desktop session disconnected. Your next message starts a separate Telegram conversation.");
++    return;
++  }
++  const sessions = (ctx.runtime.sessionStore.listRecent?.(100) ?? []).filter(isMacSession);
++  const active = sessions.filter(session => ctx.runtime.turnController.isBusy(session.id));
++  const session = id ? ctx.runtime.sessionStore.load(id) : active.length === 1 ? active[0] : active.length > 1 ? null : sessions[0];
++  if (!session || !isMacSession(session)) {
++    await sendText(ctx, ref.target, [
++      "No desktop session was selected. Start a task in the updated Atomic terminal interface, then send /desktop. If several tasks are running, choose one with /desktop <session-id>.",
++      ...sessions.slice(0, 10).map(item => `${item.id} — ${item.workingDir}${ctx.runtime.turnController.isBusy(item.id) ? " (running)" : ""}`),
++    ].join("\n"));
++    return;
++  }
++  const holder = ctx.sessionPointer.entries().find(entry => entry.chatKey !== ref.key && entry.entry.current === session.id);
++  if (holder) {
++    await sendText(ctx, ref.target, "This session is already linked to another Telegram chat.");
++    return;
++  }
++  const previous = ctx.sessionPointer.get(ref.key).current;
++  if (previous && previous !== session.id) ctx.releaseApprovalSession?.(previous);
++  ctx.sessionPointer.setCurrent(ref.key, session.id, "Desktop");
++  await sendText(ctx, ref.target, `Desktop session connected: ${session.id}
++Project: ${session.workingDir}
++Use /status or “How far along are you?” to check progress. Use /result or “Show me the result of your analysis” to read the answer. Other messages become follow-up requests in this session.`);
++}
++
+ async function switchSession(
+   sessionId: string | undefined,
+   ref: ChatRef,
+@@ -878,9 +1039,14 @@ async function dispatchToRuntime(
+   ref: ChatRef,
+   ctx: InboundContext,
+   sender: SenderIdentity | null = null,
++  desktopSession?: SessionState,
++  queuedSignal?: AbortSignal,
+ ): Promise<void> {
+-  const prompt = withSenderIdentity(text, sender);
+-  const session = acquireOrCreateSession(ref, ctx);
++  const session = desktopSession ?? acquireOrCreateSession(ref, ctx);
++  const prompt = withSenderIdentity(
++    isMacSession(session) ? `Respond in English.\n\n${text}` : text,
++    sender,
++  );
+   // Count agent-visible inbound messages (post owner-check, post
+   // slash-command-shortcut). Slash commands and dropped non-owner
+   // DMs are intentionally excluded — they never reach `runTurn`.
+@@ -891,8 +1057,12 @@ async function dispatchToRuntime(
+   // turn step can request approval — `ApprovalRouter.setForSession`
+   // is the only path that turns a generic `ApprovalRequest` into a
+   // 2-button keyboard in this chat. Idempotent on the channel side.
+-  ctx.ensureApprovalSession?.(session.id, ref.target);
++  const macSession = isMacSession(session);
++  if (!macSession) ctx.ensureApprovalSession?.(session.id, ref.target);
++  let macApprovalsBound = false;
++  let macTurnEnded = false;
+   const controller = new AbortController();
++  const turnSignal = queuedSignal ? AbortSignal.any([queuedSignal, controller.signal]) : controller.signal;
+   ctx.inflight.set(ref.key, controller);
+ 
+   let reply: string | null = null;
+@@ -967,6 +1137,15 @@ async function dispatchToRuntime(
+           cadence.pollMs,
+         );
+   const eventHook = (event: AgentLoopEvent): void => {
++    // The runtime invokes this only after its FIFO grants this turn ownership.
++    if (macSession && !macApprovalsBound && !macTurnEnded) {
++      ctx.ensureApprovalSession?.(session.id, ref.target);
++      macApprovalsBound = true;
++    }
++    if (macSession && (event.type === "loop_completed" || event.type === "loop_failed")) {
++      ctx.releaseApprovalSession?.(session.id);
++      macTurnEnded = true;
++    }
+     tracker.onEvent(event);
+     if (event.type === "step_finished") postSnapshotIfDue();
+     if (event.type === "llm_event") {
+@@ -994,7 +1173,7 @@ async function dispatchToRuntime(
+   try {
+     const result = await ctx.runtime.runTurn(session, prompt, {
+       origin: "telegram",
+-      signal: controller.signal,
++      signal: turnSignal,
+       eventHook,
+     });
+     // A steer accepted for this turn but never delivered: the chat is
+@@ -1023,6 +1202,7 @@ async function dispatchToRuntime(
+     if (ctx.liveTurns?.get(ref.key) === tracker) {
+       ctx.liveTurns.delete(ref.key);
+     }
++    if (macSession) ctx.releaseApprovalSession?.(session.id);
+     releaseIfMovedOn(ref, session.id, ctx);
+   }
+ 
+@@ -1038,7 +1218,7 @@ async function dispatchToRuntime(
+ 
+   // A cancelled turn's half-written answer is deleted; a failed one's
+   // stays above the failure line.
+-  if (controller.signal.aborted) await live?.discard();
++  if (turnSignal.aborted) await live?.discard();
+   else if (reply === null) await live?.close();
+ 
+   // Only the agent's natural-language reply gets parse-mode
+@@ -1047,7 +1227,7 @@ async function dispatchToRuntime(
+   // the operator never confuses runtime telemetry with agent
+   // content (and so a stray `<` in an error message can never
+   // collide with the HTML grammar).
+-  if (controller.signal.aborted) {
++  if (turnSignal.aborted) {
+     await sendText(ctx, ref.target, "Turn cancelled.");
+   } else if (reply !== null) {
+     const parseMode = ctx.agentReplyParseMode ?? "plain";
+@@ -1197,6 +1377,9 @@ function formatStatus(ref: ChatRef, ctx: InboundContext): string {
+     return withTasks(`Pointer references missing session ${entry.current}.`);
+   }
+   const busy = ctx.runtime.turnController.isBusy(session.id);
++  if (ref.isPrivate && isMacSession(session)) {
++    return desktopStatus(session, ref, ctx);
++  }
+   const lines = [
+     `Session: ${session.id}`,
+     `Status: ${session.status}${busy ? " (turn in progress)" : ""}`,
+diff --git a/src/channels/telegram/mac-session-bridge.test.ts b/src/channels/telegram/mac-session-bridge.test.ts
+new file mode 100644
+index 0000000..aa8618f
+--- /dev/null
++++ b/src/channels/telegram/mac-session-bridge.test.ts
+@@ -0,0 +1,57 @@
++import { describe, expect, it } from "vitest";
++import { createEmptySessionState } from "../../session/index.js";
++import { isMacSession, macReadCommand, macResult, macStatus } from "./mac-session-bridge.js";
++
++function session() {
++  return createEmptySessionState({
++    id: "desktop-example",
++    workingDir: "/workspace/example",
++    metadata: { macTelegramBridge: true },
++  });
++}
++
++describe("desktop session reading", () => {
++  it("recognizes English progress and analysis requests without inference", () => {
++    expect(macReadCommand("How far along are you?")).toBe("status");
++    expect(macReadCommand("Show me the result of your analysis.")).toBe("result");
++    expect(macReadCommand("Implement the plan")).toBeNull();
++    expect(macReadCommand("Wie weit bist du?")).toBe("status");
++  });
++
++  it("returns English status and notices", () => {
++    const value = session();
++    value.plan = { items: [{ step: "Review the modules", status: "in_progress" }], updatedAt: 2 };
++    expect(macStatus(value, true)).toContain("Status: running");
++    expect(macStatus(value, true)).toContain("Current step: Review the modules");
++    expect(macResult(value, true)).toContain("The task is still running");
++    expect(macResult(value, false)).toContain("No final answer");
++  });
++
++  it("does not show an older plan as the result of a new request", () => {
++    const value = session();
++    value.turns = [{ kind: "user", text: "New analysis", at: 100 }];
++    value.plan = { items: [{ step: "Old plan", status: "done" }], updatedAt: 1 };
++    expect(macResult(value, true)).not.toContain("Old plan");
++    value.plan.updatedAt = 101;
++    expect(macResult(value, true)).toContain("Old plan");
++  });
++
++  it("returns the final answer verbatim and ignores progress and stopped replies", () => {
++    const value = session();
++    value.turns = [
++      { kind: "user", text: "Analyse", at: 1 },
++      { kind: "assistant_reply", text: "Working...", progressNote: true, at: 2 },
++      { kind: "assistant_reply", text: "Stopped", stopped: true, at: 3 },
++    ];
++    expect(macResult(value, false)).not.toContain("Stopped");
++    value.turns.push({ kind: "assistant_reply", text: "## Analysis\nOriginal details.", at: 4 });
++    expect(macResult(value, false)).toBe("## Analysis\nOriginal details.");
++  });
++
++  it("excludes incognito sessions and sessions without desktop provenance", () => {
++    const value = session();
++    expect(isMacSession(value)).toBe(true);
++    expect(isMacSession({ ...value, metadata: {} })).toBe(false);
++    expect(isMacSession({ ...value, incognito: { since: 1, owner: "fixture" } })).toBe(false);
++  });
++});
+diff --git a/src/channels/telegram/mac-session-bridge.ts b/src/channels/telegram/mac-session-bridge.ts
+new file mode 100644
+index 0000000..eeabde4
+--- /dev/null
++++ b/src/channels/telegram/mac-session-bridge.ts
+@@ -0,0 +1,52 @@
++import { isIncognitoSession, type SessionState } from "../../session/index.js";
++
++export const MAC_BRIDGE_MARKER = "macTelegramBridge";
++
++export function isMacSession(session: SessionState): boolean {
++  return session.metadata?.[MAC_BRIDGE_MARKER] === true && !isIncognitoSession(session);
++}
++
++export function macReadCommand(text: string): "status" | "result" | null {
++  const value = text.trim().toLowerCase().replace(/[?!.]+$/u, "").trim();
++  if (["wie weit bist du", "wie weit", "status", "fortschritt", "how far are you", "how is it going", "how far along are you", "what is your progress"].includes(value)) return "status";
++  if (["zeige mir das ergebnis", "zeige mir das ergebnis deiner analyse", "zeige mir den plan", "ergebnis", "show me the result", "show me the plan", "show me the result of your analysis", "show me your analysis"].includes(value)) return "result";
++  return null;
++}
++
++export function macStatus(session: SessionState, busy: boolean): string {
++  const lines = [
++    `Desktop session: ${session.id}`,
++    `Project: ${session.workingDir}`,
++    `Status: ${busy ? "running" : session.status}`,
++    `Steps: ${session.stepCount}`,
++  ];
++  if (session.plan?.items.length) {
++    const done = session.plan.items.filter(item => item.status === "done").length;
++    lines.push(`Plan: ${done}/${session.plan.items.length} completed`);
++    const current = session.plan.items.find(item => item.status === "in_progress");
++    if (current) lines.push(`Current step: ${current.step}`);
++  }
++  if (session.latestResult) lines.push(`Last result: ${session.latestResult.summary.slice(0, 700)}`);
++  if (session.lastError) lines.push(`Notice: ${session.lastError.slice(0, 500)}`);
++  return lines.join("\n");
++}
++
++export function macResult(session: SessionState, busy: boolean): string {
++  // Show only an answer to the current request, never a previous turn's plan.
++  const recent = [...session.turns].reverse();
++  const request = recent.findIndex(turn => turn.kind === "user" && !turn.steered);
++  const reply = recent.slice(0, request < 0 ? recent.length : request).find(turn =>
++    turn.kind === "assistant_reply" && !turn.progressNote && !turn.stopped
++  );
++  if (reply?.kind === "assistant_reply") return reply.text;
++  const latestRequestAt = request < 0 ? 0 : recent[request]!.at;
++  const plan = session.plan && session.plan.updatedAt >= latestRequestAt
++    ? session.plan.items.map(item =>
++        `${item.status === "done" ? "✓" : item.status === "in_progress" ? "→" : "•"} ${item.step}`
++      ).join("\n")
++    : undefined;
++  return [
++    busy ? "The task is still running. A final answer is not available yet." : "No final answer is available for the latest request.",
++    plan ? `Work plan so far:\n${plan}` : "",
++  ].filter(Boolean).join("\n\n");
++}
+diff --git a/src/channels/telegram/telegram-channel.test.ts b/src/channels/telegram/telegram-channel.test.ts
+index c7b172d..d8a00bf 100644
+--- a/src/channels/telegram/telegram-channel.test.ts
++++ b/src/channels/telegram/telegram-channel.test.ts
+@@ -406,6 +406,11 @@ describe("TelegramChannel", () => {
+       "help",
+       "status",
+       "sessions",
++      "desktop",
++      "mac",
++      "queue",
++      "stop",
++      "result",
+       "switch",
+       "new",
+       "model",
+diff --git a/src/channels/telegram/telegram-channel.ts b/src/channels/telegram/telegram-channel.ts
+index 90b720e..36d3f23 100644
+--- a/src/channels/telegram/telegram-channel.ts
++++ b/src/channels/telegram/telegram-channel.ts
+@@ -1,3 +1,4 @@
++import { DesktopRequestQueue } from "./desktop-request-queue.js";
+ import { resolve } from "node:path";
+ 
+ import type { ChannelStatus } from "../../runtime/channel-status.js";
+@@ -171,6 +172,7 @@ export class TelegramChannel implements Channel {
+   private readonly settings: TelegramSettingsSink;
+   /** `chatKey -> AbortController` for the turn running in that chat/topic. */
+   private readonly inflight = new Map<string, AbortController>();
++  private readonly desktopQueues = new Map<string, DesktopRequestQueue>();
+   /** Albums still arriving — see `InboundContext.mediaGroups`. */
+   private readonly mediaGroups = new Map<string, PendingMediaGroup>();
+   /** `chatKey -> status` of the turn running there (ATO-965), for `/status`. */
+@@ -433,6 +435,7 @@ export class TelegramChannel implements Channel {
+           this.deps.config.telegram.streamReplies,
+         ),
+         inflight: this.inflight,
++        desktopQueues: this.desktopQueues,
+         liveTurns: this.liveTurns,
+         statusSnapshot: this.deps.config.statusSnapshot ?? null,
+         pendingApprovalTool: (sessionId) =>
+@@ -457,6 +460,11 @@ export class TelegramChannel implements Channel {
+           { command: "help", description: "Show help" },
+           { command: "status", description: "What this chat's turn is doing now" },
+           { command: "sessions", description: "List sessions by chat" },
++          { command: "desktop", description: "Connect to a desktop session; /desktop off disconnects" },
++          { command: "mac", description: "Alias for /desktop" },
++          { command: "queue", description: "Queue a request for the linked desktop session" },
++          { command: "stop", description: "Stop the desktop task and queued remote requests" },
++          { command: "result", description: "Show the desktop session's analysis or result" },
+           {
+             command: "switch",
+             description: "Continue an existing session here",
+@@ -716,6 +724,8 @@ export class TelegramChannel implements Channel {
+     this.stopRequested = true;
+     this.transition("stopping", null);
+     this.pairing.cancel();
++    for (const queue of this.desktopQueues.values()) queue.cancelAll();
++    this.desktopQueues.clear();
+     for (const controller of this.inflight.values()) {
+       try {
+         controller.abort();
+diff --git a/src/runtime/composition/runtime-turn-service.test.ts b/src/runtime/composition/runtime-turn-service.test.ts
+index 9c1ef35..9dc1a68 100644
+--- a/src/runtime/composition/runtime-turn-service.test.ts
++++ b/src/runtime/composition/runtime-turn-service.test.ts
+@@ -294,12 +294,25 @@ describe("runtime turn ownership recipes", () => {
+     const gate = deferred<void>();
+     fixture.loop.runTurn.mockImplementationOnce(async (value, options) => { await gate.promise; return result(value, options); });
+     const stale = session();
+-    const first = fixture.service.runTurn(stale, "first", { origin: "scheduler" });
+-    const second = fixture.service.runTurn(stale, "second", { origin: "scheduler" });
++    const first = fixture.service.runTurn(stale, "first", { origin: "tui" });
++    const second = fixture.service.runTurn(stale, "second", { origin: "telegram" });
+     gate.resolve();
+     await Promise.all([first, second]);
+     expect(fixture.loop.runTurn.mock.calls[1]?.[0].turns).toHaveLength(2);
+     expect(fixture.rows.get(stale.id)?.turns).toHaveLength(4);
++    expect(fixture.rows.get(stale.id)?.metadata.macTelegramBridge).toBe(true);
++  });
++
++  it("cancels an active desktop turn through the runtime-owned signal", async () => {
++    fixture.loop.runTurn.mockImplementationOnce(async (value, options) => {
++      await new Promise<void>(resolve => options.signal!.addEventListener("abort", () => resolve(), { once: true }));
++      return { session: value, reason: "cancelled", stepCount: 0 };
++    });
++    const running = fixture.service.runTurn(session(), "Analyse", { origin: "tui" });
++    await vi.waitFor(() => expect(fixture.loop.runTurn).toHaveBeenCalledOnce());
++    expect(fixture.turnController.cancelCurrent("session")).toBe(true);
++    expect((await running).reason).toBe("cancelled");
++    expect(fixture.turnController.cancelCurrent("session")).toBe(false);
+   });
+ 
+   it("queued cancellation never invokes the loop and different sessions remain independent", async () => {
+diff --git a/src/runtime/composition/runtime-turn-service.ts b/src/runtime/composition/runtime-turn-service.ts
+index 9d080f7..5d09573 100644
+--- a/src/runtime/composition/runtime-turn-service.ts
++++ b/src/runtime/composition/runtime-turn-service.ts
+@@ -826,6 +826,13 @@ export function createRuntimeTurnService(
+           }),
+       );
+     }
++    const cancellation = new AbortController();
++    runOptions = {
++      ...runOptions,
++      signal: runOptions.signal
++        ? AbortSignal.any([runOptions.signal, cancellation.signal])
++        : cancellation.signal,
++    };
+     // Before the queue, so a bad pin rejects now rather than after
+     // waiting behind whatever is running on the session.
+     assertKnownProvider(runOptions.providerId, runOptions.model);
+@@ -833,6 +840,7 @@ export function createRuntimeTurnService(
+     const submission = {
+       sessionId: session.id,
+       origin,
++      cancel: () => cancellation.abort(),
+       // Re-read the freshest stored session when the queue hands over
+       // the lock, not when the caller enqueued: between those moments a
+       // turn from another origin (scheduler, HTTP, a TUI thread the
+@@ -847,6 +855,7 @@ export function createRuntimeTurnService(
+       run: () =>
+         timeTurn(session.id, origin, () => {
+           const fresh = sessionStore.load(session.id) ?? session;
++          if (origin === "tui") fresh.metadata.macTelegramBridge = true;
+           // ATO-42: on the copy the turn runs and saves, never before the lock.
+           applySessionProject(fresh, runOptions.project);
+           return executeTurn(fresh, userMessage, runOptions);
+diff --git a/src/runtime/turn-controller.test.ts b/src/runtime/turn-controller.test.ts
+index ba3335f..3c83198 100644
+--- a/src/runtime/turn-controller.test.ts
++++ b/src/runtime/turn-controller.test.ts
+@@ -525,3 +525,28 @@ interface TurnSubmissionLog {
+   origin: "http" | "scheduler";
+   phase: "start" | "end";
+ }
++
++describe("cancellation ownership", () => {
++  it("cancels only the active submission of the selected session", async () => {
++    const controller = new TurnController();
++    let release!: () => void;
++    const cancelFirst = vi.fn(() => release());
++    const cancelSecond = vi.fn();
++    const first = controller.enqueue({
++      sessionId: "one", origin: "tui",
++      cancel: cancelFirst,
++      run: () => new Promise<void>(resolve => { release = resolve; }),
++    });
++    const second = controller.enqueue({
++      sessionId: "one", origin: "telegram", cancel: cancelSecond,
++      run: async () => {},
++    });
++    await waitUntil(() => controller.isBusy("one"));
++    expect(controller.cancelCurrent("another-session")).toBe(false);
++    expect(controller.cancelCurrent("one")).toBe(true);
++    await Promise.all([first, second]);
++    expect(cancelFirst).toHaveBeenCalledOnce();
++    expect(cancelSecond).not.toHaveBeenCalled();
++    expect(controller.cancelCurrent("one")).toBe(false);
++  });
++});
+diff --git a/src/runtime/turn-controller.ts b/src/runtime/turn-controller.ts
+index 9ed0d13..88fb324 100644
+--- a/src/runtime/turn-controller.ts
++++ b/src/runtime/turn-controller.ts
+@@ -47,6 +47,8 @@ export interface TurnSubmission<T> {
+    * `AgentLoop.runTurn` (directly or via `runtime.runTurn`).
+    */
+   run: () => Promise<T>;
++  /** Cancel only this submission while it owns the session, never a queued successor. */
++  cancel?: () => void;
+   /**
+    * Optional per-submission event hook. Receives every `AgentLoopEvent`
+    * emitted via `controller.emit(sessionId, event)` during the lifetime
+@@ -94,6 +96,7 @@ export class TurnController {
+   private readonly queues = new Map<string, Promise<unknown>>();
+   private readonly currentHooks = new Map<string, TurnEventHook>();
+   private readonly busy = new Set<string>();
++  private readonly cancellations = new Map<string, () => void>();
+   private readonly onHookError?: (
+     err: unknown,
+     context: { sessionId: string; origin: TurnOrigin },
+@@ -158,10 +161,12 @@ export class TurnController {
+         this.currentHooks.set(sessionId, eventHook);
+       }
+       this.busy.add(sessionId);
++      if (submission.cancel) this.cancellations.set(sessionId, submission.cancel);
+       try {
+         return await run();
+       } finally {
+         this.busy.delete(sessionId);
++        this.cancellations.delete(sessionId);
+         if (eventHook) {
+           this.currentHooks.delete(sessionId);
+         }
+@@ -196,6 +201,13 @@ export class TurnController {
+    * No-op when no submission is currently running for `sessionId` —
+    * stale events from a cancelled turn never leak to the next one.
+    */
++  cancelCurrent(sessionId: string): boolean {
++    const cancel = this.cancellations.get(sessionId);
++    if (!cancel) return false;
++    cancel();
++    return true;
++  }
++
+   emit(sessionId: string, event: AgentLoopEvent): void {
+     const hook = this.currentHooks.get(sessionId);
+     if (!hook) return;

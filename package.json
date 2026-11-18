@@ -1,0 +1,15 @@
+{
+  "name": "atomic-agent-telegram-session-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Continue Atomic Agent desktop sessions from a paired Telegram chat.",
+  "license": "MIT",
+  "engines": { "node": ">=25.7.0" },
+  "scripts": {
+    "install:runtime": "node scripts/install.mjs",
+    "start": "node scripts/run.mjs tui",
+    "verify:runtime": "node scripts/verify.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}
