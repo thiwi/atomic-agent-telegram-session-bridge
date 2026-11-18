@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Use the explicit macOS Intel CI pool after GitHub failed to allocate Apple Silicon runners; retain an Apple Silicon option for manual runs.
 - Add read-only `/review [diff]` with recorded check evidence and one-use plan approval/rejection buttons.
 - Check session and Git freshness on approval and under the runtime lock before implementation.
 - Pin current official CI actions, disable persisted checkout credentials, bound job runtime and cancel superseded runs.

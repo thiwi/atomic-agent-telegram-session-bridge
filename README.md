@@ -52,7 +52,11 @@ new session markers use desktop-neutral names. Existing sessions with the legacy
 It has no Homebrew, shell,
 Keychain, MLX, absolute home directory, or Apple hardware dependency.
 CI installs the pinned upstream source and runs the checks on macOS, Linux,
-and Windows. Atomic's own model, browser, and native package requirements also
+and Windows. Default macOS CI uses the explicit `macos-15-intel` pool because
+GitHub's Apple Silicon pool has experienced runner allocation failures before
+any test starts. For an additional Apple Silicon check, run the Test workflow
+manually and select `macos-latest` in `macos_runner`. All platforms run the same
+required checks; no failed tests are ignored. Atomic's own model, browser, and native package requirements also
 apply. Choose a provider and model supported by your host.
 
 ## Install

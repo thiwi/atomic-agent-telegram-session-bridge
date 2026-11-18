@@ -3,6 +3,14 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      macos_runner:
+        description: macOS runner (Intel by default; Apple Silicon available for explicit checks)
+        type: choice
+        default: macos-15-intel
+        options:
+          - macos-15-intel
+          - macos-latest
 
 permissions:
   contents: read
@@ -17,7 +25,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macos-latest currently uses the capacity-constrained arm64 pool.
+        # Keep macOS required; select Apple Silicon explicitly for additional checks.
+        os: [ubuntu-latest, "${{ inputs.macos_runner || 'macos-15-intel' }}", windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
